@@ -178,12 +178,6 @@ final class SingleSignOnProcessor: StateProcessor<SingleSignOnState, SingleSignO
                 keyConnectorURL: keyConnectorUrl,
                 orgIdentifier: state.identifierText,
             )
-
-            try await services.authRepository.unlockVaultWithKeyConnectorKey(
-                keyConnectorURL: keyConnectorUrl,
-                orgIdentifier: state.identifierText,
-            )
-
             await coordinator.handleEvent(.didCompleteAuth)
             coordinator.navigate(to: .dismiss)
         } catch {
