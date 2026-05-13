@@ -95,3 +95,7 @@ BitwardenKit/Core/Platform/Utilities/SDKVersionInfo.swift
 __pycache__/
 *.py[codz]
 *$py.class
+
+# App Report 4 audit artifacts
+audit/traces/
+*.trace
