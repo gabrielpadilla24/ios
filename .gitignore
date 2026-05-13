@@ -102,3 +102,5 @@ audit/traces/
 
 # Local signing overrides (App Report 4 audit)
 Configs/Local-*.xcconfig
+
+Bitwarden/Application/Support/Bitwarden.entitlements.original
