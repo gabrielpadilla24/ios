@@ -99,3 +99,6 @@ __pycache__/
 # App Report 4 audit artifacts
 audit/traces/
 *.trace
+
+# Local signing overrides (App Report 4 audit)
+Configs/Local-*.xcconfig
