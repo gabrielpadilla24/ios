@@ -1,7 +1,7 @@
 # Bitwarden iOS — Profiling Log (App Report 4)
 
 **Repository:** bitwarden/ios (audit fork: gabrielpadilla24/ios)
-**Branch audited:** main @ commit [PLACEHOLDER — actualizar tras primer build]
+**Branch audited:** main
 **Audit branch:** audit/app-report-4
 
 **Profiling host:** macOS [version], Apple Silicon
@@ -80,11 +80,12 @@ Three independent cold-start runs were executed per instrument, with the simulat
 **Instruments used for S1:**
 - App Launch (cold start latency, dyld activity, thread state) — completed
 - Allocations + Leaks (memory footprint, leak detection, allocation patterns) — completed
-- Core Animation (GPU rendering, frame rate, hitches) — pending
-- Color Blended Layers toggle (overdrawing visualization) — pending
-- Time Profiler (CPU profile, main thread analysis) — pending
+- Color Blended Layers debug overlay (overdrawing visualization) — completed
+- Animation Hitches template (Display + Time Profiler + Thread State Trace + Thermal State + Hangs sub-instruments; the Hitches sub-instrument is not supported on Simulator and was removed) — completed
+- Metal System Trace (GPU consumption analysis attempt) — failed, see "GPU consumption — scope limitation" subsection
+- Energy Log (power consumption analysis) — not attempted, physical-device-only, see "Power consumption — scope limitation" subsection
 
-**Raw screenshots:** `audit/profiling/screenshots/s1_app_launch/` (12 PNGs, 3 runs) and `audit/profiling/screenshots/s1_allocations/` (12 PNGs, 3 runs).
+**Raw screenshots:** `audit/profiling/screenshots/s1_app_launch/` (12 PNGs, 3 runs), `audit/profiling/screenshots/s1_allocations/` (12 PNGs, 3 runs), `audit/profiling/screenshots/s1_overdrawing/` (4 PNGs), and `audit/profiling/screenshots/s1_threading/` (18 PNGs, 3 runs). Total: 46 PNGs documenting S1.
 
 ---
 
@@ -110,6 +111,24 @@ Surface composition during cold start is visible in the Display 1 surface track:
 **Problems:**
 - The cluster of hangs detected by the Hangs instrument (1 in Run 1, 3 in Run 2, 5 in Run 3 — see Threading T-iii) does coincide temporally with surface composition events in the Display track, meaning the user perceives the unresponsiveness during the visual transition from splash to vault. The render pipeline itself is healthy; the work being done on the main thread blocks frame presentation.
 - The Hitches sub-instrument is unavailable on Simulator, so finer-grained metrics (hitch ratio, hitch duration percentile, frame deadlines missed) cannot be quantified without a physical device. This is a free-tier / Simulator limitation, not an app defect.
+
+### GPU consumption — scope limitation
+
+The rubric (item 2) requires GPU consumption analysis. The appropriate Instruments templates for measuring GPU utilization percentage, GPU memory pressure, and per-frame GPU commit cost on iOS are Metal System Trace and the now-deprecated Core Animation instrument (removed in Xcode 26).
+
+**Metal System Trace was attempted** on the iPhone 17 Pro simulator (iOS 26.3.1) with the same target configuration used for the other S1 instruments. Instruments returned **"Failed to load configuration options for iPhone 17 Pro (26.3.1). Error during device communication."** for the Metal Application sub-instrument, and **"No Recording Options"** for the GPU, Display, Metal Resource Events, and Thermal State sub-instruments. The Apple Silicon iOS Simulator does not expose the host Metal stack as a profilable GPU target for iOS apps; Apple's documentation indicates these instruments require a physical iOS device.
+
+**What is reported instead, from the Animation Hitches template's Display sub-instrument:** Average Frame Time per run, VSync alignment, and surface composition (Surface 7 → 8 → 9 chain). These cover the *rendering time* question (rubric item 3.a) but do not give GPU utilization percentages.
+
+Free-tier Apple Developer provisioning (Personal Team, 7-day certificate) prevents practical physical-device deployment at audit timescale (would require re-signing every 7 days for the 3-week audit window). Documented as scope limitation, consistent with the same limitation that applies to power consumption analysis below.
+
+### Power consumption — scope limitation
+
+The rubric (item 2) also requires power consumption analysis. The Energy Log instrument is the appropriate tool but is **physical-device-only** — it requires hardware energy counters not available in the iOS Simulator.
+
+The same free-tier provisioning limitation that blocks Metal System Trace also blocks Energy Log usage. As an indirect proxy, the Animation Hitches template's Thermal State sub-instrument reports `Nominal` across all 30 seconds of every S1 run (3 runs), indicating that whatever the actual power draw is, it is below the threshold where the OS begins thermal throttling. Time Profiler additionally reports total CPU residency (Bitwarden 14.62-40.45 s of CPU time across 30 s wall-clock per run); high-quality power estimation would require correlating this with per-core frequency states, which Energy Log provides and Simulator does not.
+
+Documented as scope limitation alongside GPU consumption. The two limitations are recorded together because they share the same underlying cause (free-tier provisioning blocking physical-device deployment).
 
 ---
 ---
