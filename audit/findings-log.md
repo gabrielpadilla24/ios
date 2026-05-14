@@ -3,8 +3,10 @@
 Findings observed during runtime setup of the audit fork (free Apple Developer account, iPhone 17 Pro simulator, iOS 26.3.1).
 These will be triaged into final report sections (§8 Memory, §9 ECn/Robustness, §13 Optimizations) after profiling completes.
 
-Audit commit: 5218b7f21bce14622b823e41e844844aeedd593b
-Date: 2026-05-13
+- Audit commit: 5218b7f21bce14622b823e41e844844aeedd593b
+- Date: 2026-05-13
+- Environment: macOS, Xcode 26.5, free-tier Apple Developer Team U67Q3MTU2M
+- Custom bundle ID: com.gabrielpadilla24.bwaudit.passwordmanager
 
 ---
 
@@ -15,7 +17,7 @@ Date: 2026-05-13
 - **Symptom:** Fatal error "Unexpectedly found nil while unwrapping an Optional value". Crash occurs in DataStore.init before any UI is rendered.
 - **Root cause:** FileManager.default.containerURL(forSecurityApplicationGroupIdentifier:)! force-unwraps a nullable return.
 - **Workaround applied (local-only):** Modified ServiceContainer.swift:498 to pass storeType: .memory, bypassing the persisted-store branch.
-- **Category:** Memory anti-pattern (force-unwrap) + Robustness (entitlement-dependent code without graceful degradation).
+- **Category:** Memory anti-pattern (force-unwrap) + Robustness.
 
 ---
 
@@ -26,7 +28,7 @@ Date: 2026-05-13
 - **Symptom:** Same crash, different stack frame.
 - **Workaround applied (local-only):** Modified ServiceContainer.swift:1097 to pass storeType: .memory.
 - **Category:** Memory anti-pattern + Robustness.
-- **Pattern observation:** Same anti-pattern as F-RT-01 replicated across modules, indicating a systemic architectural issue rather than an isolated bug.
+- **Pattern observation:** Same anti-pattern replicated across modules, indicating systemic architectural issue rather than isolated bug.
 
 ---
 
@@ -34,7 +36,7 @@ Date: 2026-05-13
 
 - **Component:** Resource loading, BitwardenResources.framework.
 - **Symptom:** OS console emits multiple "GSFont: file already registered" warnings for the DMSans typeface family (Bold, Regular, SemiBold, Italic, BoldItalic, SemiBoldItalic) at every app launch.
-- **Hypothesis:** Either (a) the same font file is bundled in multiple frameworks (main app + BitwardenShared + BitwardenResources), or (b) the registration happens multiple times during framework initialization.
+- **Hypothesis:** The same font file is either bundled in multiple frameworks (main app + BitwardenShared + BitwardenResources), or the registration happens multiple times during framework initialization.
 - **Impact:** Not blocking, but indicates redundant resource loading and minor app startup overhead.
 - **Category:** Resource loading anti-pattern.
 
@@ -58,3 +60,11 @@ Date: 2026-05-13
 - **Workaround applied (local-only):** Modified ErrorReporterFactory.swift to always return OSLogErrorReporter() regardless of build configuration.
 - **Suggested upstream fix:** Wrap FIRApp.configure() in @try/@catch (Objective-C exception handler) or behind a runtime flag that disables Crashlytics when the plist is invalid or missing.
 - **Category:** Coupling to production environment + Robustness + Architecture.
+
+---
+
+## Setup observations (non-blocking)
+
+- Build warnings: 75 SwiftLint warnings on main app target (mostly trailing-comma, unused-closure-parameter, superfluous-disable-command rules). These reflect ongoing lint-debt in the upstream codebase.
+- Vault sync from server: with 150 items, sync to fully-rendered vault list took approximately 5-10 seconds on first cold-start over WiFi. Subsequent re-launches with in-memory store start from scratch (no persistence) but re-sync is similar.
+- 12 favorites confirmed visible in vault list, matching seed CSV.
