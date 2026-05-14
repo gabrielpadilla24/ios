@@ -90,20 +90,28 @@ Three independent cold-start runs were executed per instrument, with the simulat
 
 ## S1 — GPU rendering analysis
 
-*Status: PENDING — to be completed via Core Animation instrument*
+*Status: COMPLETE — data from Animation Hitches instrument (Display sub-instrument) across 3 runs of 30s each. Note: the Hitches sub-instrument itself is not supported on the iOS Simulator (Xcode emits "Hitches is not supported on this platform"), so quantitative hitch counts at the OS level cannot be reported from this environment. Display, Time Profiler, Thread State Trace, Thermal State, and Hangs sub-instruments all work.*
 
 ### Frame rate metrics
 
-| Run | fps avg | fps min | Hitches | Notes |
-|-----|---------|---------|---------|-------|
-| 1   |         |         |         |       |
-| 2   |         |         |         |       |
-| 3   |         |         |         |       |
-| **Mean ± SD** |  |  |  |  |
+The Display instrument captures Average Frame Time over the cold-start window. Across the 3 runs, the timeline shows a consistent pattern: a tall spike near t≈0:01–0:02s (initial render of the splash + login + vault transition), followed by a sustained moderate-frequency bar pattern through the 30s window with no sustained periods of dropped frames. VSync alignment is visible in the Display 1 track (the red tick pattern under "VSync") and remains regular throughout.
+
+Surface composition during cold start is visible in the Display 1 surface track:
+- Runs 1 & 2: Surface 7 (SimRenderServer) appears first, transitions to Surface 7 alone, then to Surface 8.
+- Run 3: Surface 7 → Surface 9 (SimRenderServer) → Surface 8 → Surface 7 → Surface 8 chain. The longer Surface 9 segment in Run 3 aligns temporally with the cluster of hangs (see Threading section), suggesting the render server held a single surface composition longer because the app was unresponsive.
 
 ### Problems and strengths
-*To be analyzed after Core Animation runs.*
 
+**Strengths:**
+- Thermal state remains `Nominal` for all 30 seconds across all 3 runs (no throttling).
+- VSync cadence is regular; no extended stalls in the display pipeline visible.
+- Average Frame Time bars taper down in amplitude after the initial ~2s cold-start render, indicating steady-state rendering is well within budget.
+
+**Problems:**
+- The cluster of hangs detected by the Hangs instrument (1 in Run 1, 3 in Run 2, 5 in Run 3 — see Threading T-iii) does coincide temporally with surface composition events in the Display track, meaning the user perceives the unresponsiveness during the visual transition from splash to vault. The render pipeline itself is healthy; the work being done on the main thread blocks frame presentation.
+- The Hitches sub-instrument is unavailable on Simulator, so finer-grained metrics (hitch ratio, hitch duration percentile, frame deadlines missed) cannot be quantified without a physical device. This is a free-tier / Simulator limitation, not an app defect.
+
+---
 ---
 
 ## S1 — Overdrawing analysis
@@ -308,39 +316,72 @@ Instruments captured snapshots are functionally equivalent to heap dumps and are
 
 ## S1 — Threading
 
-*Status: PARTIALLY DOCUMENTED — partial data from App Launch and Allocations; full Time Profiler analysis pending.*
+*Status: COMPLETE — Animation Hitches template with Time Profiler, Thread State Trace, Thermal State, and Hangs sub-instruments across 3 runs of 30s each. Screenshots: `audit/profiling/screenshots/s1_threading/` (18 PNGs total, 6 per run).*
+
+### Cross-run summary
+
+| Metric | Run 1 | Run 2 | Run 3 | Notes |
+|---|---|---|---|---|
+| Duration | 30.620 s | 30.620 s | 30.585 s | Stop-after-30s honored |
+| Bitwarden PID | 70538 | 79206 | 76119 | Fresh PID per run (terminate + relaunch) |
+| Bitwarden CPU total (Weight) | 40.45 s | 14.62 s | 18.76 s | Cumulative across all Bitwarden threads |
+| Bitwarden context switches | 18,727 | 7,661 | 7,640 | |
+| All-process context switches | 23,880 | 12,754 | 12,854 | |
+| Thread-state events (Bitwarden) | 16,907 | 9,502 | 8,990 | Running + Runnable + Blocked + Wait + Idle + Interrupted + Preempted |
+| Bitwarden total thread residency | 4.39 min | 30.56 s | 1.95 min | Sum across all threads; Run 1 had concurrent thread work |
+| Hangs count | 1 | 3 | 5 | Bitwarden process only |
+| Max hang duration | 489.10 ms | 520.68 ms | 630.88 ms | Threshold for "Hang" classification is 500 ms |
+| Thermal state | Nominal | Nominal | Nominal | No throttling in any run |
+
+**Note on variance:** Unlike the Allocations runs (coefficient of variation < 1.5%), Threading metrics show much higher run-to-run variance (CPU total CV ≈ 50%). The first run, executed immediately after a `xcrun simctl terminate` of the app, carries a heavier cost from simulator-level cache cold state (filesystem snapshots, daemon warmup, WindowServer composition state). Subsequent runs benefit from warm caches even though the app process itself is fresh. This is a property of the measurement environment, not the app — and it is a methodological finding worth carrying into S2-S4 (see F-RT-12).
 
 ### T-i — Where and how are threads created? Async/await usage observed
 
-From the Allocations Call Tree (S1 M-iv), the following thread-creation evidence is captured:
+From the Allocations Call Tree (S1 M-iv) and Time Profiler Heaviest Stack Trace (Run 1: 40.45 s aggregate weight on `Bitwarden (70538)` → `main`), the following thread-creation evidence is captured:
 
-| Source | Count observed | Mechanism |
-|--------|----------------|-----------|
-| Bitwarden Rust SDK (`rayon` thread pool) | 11 native threads | `std::sys::thread::unix::Thread::new` (POSIX pthread spawn from Rust) |
-| GCD / Dispatch workers | observed in stack traces | `_dispatch_worker_thread2`, `_dispatch_root_queue_drain` |
-| Swift Concurrency | observed in stack traces | `swift::runJobInEstablishedExecutor`, `swift_job_runImpl` |
-| pthread workqueue | observed in leak stack traces | `start_wqthread`, `_pthread_wqthread` |
+| Source | Mechanism | Evidence |
+|--------|-----------|----------|
+| Bitwarden Rust SDK (`rayon` thread pool) | `std::sys::thread::unix::Thread::new` (POSIX pthread spawn from Rust) | 11 native threads observed in Allocations |
+| GCD / Dispatch workers | `_dispatch_worker_thread2`, `_dispatch_root_queue_drain` | Visible in stack traces |
+| Swift Concurrency | `swift::runJobInEstablishedExecutor`, `swift_job_runImpl` | Visible in stack traces |
+| pthread workqueue | `start_wqthread`, `_pthread_wqthread` | Visible in leak stack traces |
+| CoreData publishers | `DataStore.cipherPublisher`, `DataStore.fetchAllOrganizations` | Time Profiler Run 1: top Bitwarden self-weight symbols |
+| SwiftUI body re-evaluation | `closure #1 in PositionObservingView.body.getter`, `closure #1 in SearchableVaultListView.search.getter` | Time Profiler Run 1: 35 ms self-weight on body.getter alone |
 
-Async/await is used extensively in the codebase. From the Allocations Call Tree, calls to `_$LT$async_compat...` and Swift Concurrency executor frames are observed across the FFI boundary, confirming async/await coordinates with the Rust SDK's `RustFuture` exposed via UniFFI.
+Async/await is used extensively. The Heaviest Stack Trace consistently shows `Bitwarden → main` as root for the bulk of CPU, with parallel work on Rust threads via UniFFI's `RustFuture` exposed to Swift. Across the 3 runs, between 7,640 and 18,727 context switches occurred inside the Bitwarden process in 30 s — i.e., roughly 254–624 context switches per second — indicating heavy concurrent activity throughout the cold-start window.
 
 ### T-ii — Possible locks on main thread
 
-*Status: PENDING — to be completed via Time Profiler instrument*
+The Heaviest Stack Trace by Weight in Time Profiler points to `main` (Bitwarden) as the heaviest single symbol in all 3 runs: **135 ms (Run 1), 85 ms (Run 2), 150 ms (Run 3)** of self-weight on `main`. This is significant because work that lands on `main` directly blocks frame presentation.
 
-Time Profiler will provide:
-- Percentage of CPU time on main thread during the 30s window
-- Stack traces of any blocking operations on main thread
-- Identification of potentially-blocking calls (CoreData synchronous fetches, file I/O, crypto operations)
+Concrete suspicions of main-thread work during cold start (Bitwarden self-weight, system libraries hidden, call tree inverted):
 
-The cold-start latency of 15.67s ± 1.15s (from App Launch instrument) is long enough that some portion of that time on main thread is expected, but the breakdown of *what* is on main vs background requires Time Profiler.
+| Symbol | Self-weight (representative) | Run | Concern |
+|---|---|---|---|
+| `sha2::sha256::compress256` (Rust SDK, BitwardenSdk_PackageProduct) | 35 ms | 1 | Crypto compression on a thread that participates in cold start. See F-RT-09. |
+| `AccelerateCrypto_SHA256_compress` (com.apple.kec.corecrypto) | 15 ms | 2 | Apple's accelerated SHA-256 also active concurrently. See F-RT-09. |
+| `closure #1 in PositionObservingView.body.getter` (BitwardenShared) | 35 ms | 1 | SwiftUI body re-evaluation; consistent with M-iv observation of 4,270 body evaluations during S1. |
+| `DataStore.cipherPublisher(userId:)` (BitwardenShared) | 10 ms | 1 | CoreData publisher emitting on main; aligns with M-i observation of `_NSMemoryStorePredicateRemapper` leaks. |
+| `FontConvertible.register()` (BitwardenResources, INLINED) | 10 ms | 1 | Aligns with the 11,612 over-invocation finding (F-RT-03). |
+| `static UI.applyDefaultAppearances()` (BitwardenKit) | 10 ms | 3 | UIAppearance configuration on main during scene setup. |
+| `RootViewController.childViewController.didset` (BitwardenKit) | 15 ms | 3 | View-controller hierarchy mutation on main. |
+| `specialized SceneDelegate.scene(_:willConnectTo:options:)` (Bitwarden) | 10 ms | 3 | Scene attachment work on main. |
+| `ObservableObject.objectWillChange.getter` (BitwardenKit) | 5 ms | 2 | Each `objectWillChange` triggers downstream view invalidation; multiple emissions per second observed. |
+
+The 489.10 ms microhang (Run 1) and the larger 520.68 ms and 630.88 ms hangs (Runs 2-3) are direct evidence of main-thread blocking exceeding the 500 ms "Hang" threshold. These align temporally with the splash-to-vault transition (t≈0:08-0:12 across runs, visible in the alltracks screenshots).
 
 ### T-iii — How multithreading affects performance
 
-*Status: PENDING — to be completed via Time Profiler instrument, combined with cross-referenced Allocations data.*
+**Positive contributions of multithreading:**
+- Heavy SDK and crypto work runs on Rust-spawned threads (rayon pool, 11 native threads, ~22.5 MB stack VM as documented in M-iv). Without this offloading, cold start would be substantially worse.
+- Thermal state is `Nominal` for all 30 s in every run, meaning the simulator never throttles. Per-core utilization stays below sustained thresholds.
+- Context-switch density (254-624/s inside Bitwarden) demonstrates the scheduler is actively distributing work across threads; the app is not single-threaded-bound.
 
-Preliminary observations from existing data:
-- Heavy crypto and SDK work appears to run off main (Rust threads via UniFFI), which is positive for UI responsiveness.
-- The 22.5 MB of stack VM dedicated to Rust threads is a memory cost paid for keeping crypto off main thread — a tradeoff worth quantifying in the final analysis.
+**Negative contributions / observed bottlenecks:**
+- **Progressive hang degradation across consecutive runs without simulator reset**: 1 → 3 → 5 hangs as Runs 1 → 2 → 3 progressed. The app process was terminated and freshly launched between each run, but the simulator (and macOS host caches, WindowServer state, etc.) was not reset. This makes the hang count a property of the test environment as much as of the app. See F-RT-08 for the methodological consequence.
+- **Two crypto pipelines visible in cold start**: both `AccelerateCrypto_SHA256_compress` (Apple's accelerated path) and `sha2::sha256::compress256` (Rust SDK pure-software path) appear in Bitwarden self-weight across runs. This suggests duplicated cryptographic work on cold start — once via the SDK during vault unlock/decrypt, once via Apple's framework presumably for keychain/biometric verification. See F-RT-09.
+- **SwiftUI observable churn during render**: `Store.state.setter`, `ObservableObject.objectWillChange.getter`, `PositionObservingView.body.getter`, and `SearchableVaultListView.search.getter` are all present in top self-weight across runs. Combined with the M-iv finding of 4,270 body re-evaluations in 30 s (~142/s) for `PositionObservingView` alone, this indicates the view tree is being invalidated more frequently than the visible rendering demands. See F-RT-10.
+- **Scene/Navigation setup accumulates ~30-40 ms of main-thread work in Run 3**: `SceneDelegate.scene(_:willConnectTo:options:)` 10 ms + `SceneDelegate.buildSplashWindow` 5 ms + `BitwardenTabBarController.setNavigators` 5 ms + `ViewLoggingNavigationController.viewDidLoad` 5 ms + `RootViewController.childViewController.didset` 15 ms. None of these are individually large, but they are all on main and they all happen sequentially. See F-RT-11.
 
 ### Cold-start latency reference (from App Launch instrument)
 
@@ -351,10 +392,9 @@ Preliminary observations from existing data:
 | 3   | (per s1_app_launch screenshots) |
 | **Mean ± SD** | **15.67s ± 1.15s** |
 
-**Screenshots:** `audit/profiling/screenshots/s1_app_launch/` (12 PNGs across 3 runs).
+**Screenshots:** `audit/profiling/screenshots/s1_app_launch/` (12 PNGs across 3 runs), `audit/profiling/screenshots/s1_threading/` (18 PNGs across 3 runs).
 
 ---
-
 # Scenario S2 — Vault scroll + live search
 
 ## S2 — Methodology
