@@ -98,6 +98,73 @@ These will be triaged into final report sections (§8 Memory, §9 ECn/Robustness
 - **Category:** Entitlement-coupled persistence + Robustness.
 
 ---
+## F-RT-08: Progressive hang degradation across consecutive Instruments runs without simulator reset
+
+**Severity:** Methodological (does not affect end users; affects measurement reproducibility)
+**Source:** Threading runs S1 (Animation Hitches → Hangs instrument), 3 consecutive runs without simulator reset
+**Evidence:** Run 1 reported 1 hang (489.10 ms microhang). Run 2 reported 3 hangs (max 520.68 ms, std dev 237.00 ms). Run 3 reported 5 hangs (max 630.88 ms, std dev 219.24 ms). The app was terminated and freshly relaunched between runs (`xcrun simctl terminate` followed by fresh launch from Xcode/Instruments), but the simulator and host environment were not reset.
+**Hypothesis:** Simulator-level state (FS snapshots, daemon caches, WindowServer composition state, possibly Instruments' own deferred recording state) accumulates between runs and increases the probability of main-thread stalls being detected.
+**Recommendation:** For S2-S4 and for fragmentation runs, document whether the simulator was reset between runs; if measurement reproducibility is the goal, the simulator should be shutdown and re-booted between runs, not merely the app terminated. For end-user impact analysis, the as-tested behavior is closer to "second/third cold start of the day" and is therefore representative of a worst-case real-world condition.
+**Status:** Methodological note, no upstream issue.
+
+---
+
+## F-RT-09: Two concurrent SHA-256 pipelines active during cold start (Rust SDK + Apple Accelerate)
+
+**Severity:** Low to moderate — possibly duplicated cryptographic work on the hot path of cold start
+**Source:** Time Profiler Run 1 (BitwardenSdk_PackageProduct `sha2::sha256::compress256` 35 ms self-weight) and Run 2 (com.apple.kec.corecrypto `AccelerateCrypto_SHA256_compress` 15 ms self-weight). Both symbols appear in Bitwarden's self-weight, meaning the work is being attributed to Bitwarden threads.
+**Hypothesis:** The Rust SDK performs vault decryption / key derivation using its own pure-software SHA-256, while iOS keychain access or biometric attestation calls Apple's accelerated SHA-256 path. If the same input is being hashed twice (once per pipeline), there is room to consolidate.
+**Verification needed:** Open call-tree leaves of both symbols on a physical device run to confirm whether the input data overlaps. Pure-software SHA-256 in `BitwardenSdk` is expected (the SDK is platform-independent and bundles its own crypto for portability); this finding flags it as a candidate for *optional* native-crypto bridging if the upstream maintainers consider portability acceptable.
+**Status:** Candidate for upstream discussion; not yet filed.
+
+---
+
+## F-RT-10: SwiftUI observable churn during S1 cold start
+
+**Severity:** Moderate — contributes to main-thread CPU pressure and may amplify hang risk
+**Source:** Time Profiler all 3 runs + Allocations Call Tree (M-iv finding)
+**Evidence:**
+- `closure #1 in PositionObservingView.body.getter`: 35 ms self-weight (Run 1, Bitwarden) + 4,270 body evaluations in 30 s observed in Allocations (≈ 142/s).
+- `Store.state.setter` (BitwardenKit): 5 ms self-weight (Run 2)
+- `protocol witness for ObservableObject.objectWillChange.getter in conformance Store<A, B, C>` (BitwardenKit): 5 ms self-weight (Run 2)
+- `closure #1 in SearchableVaultListView.search.getter` (BitwardenShared): 5 ms self-weight (Run 1)
+**Hypothesis:** `PositionObservingView` is a scroll-position-tracking view that may be re-evaluating its body on every scroll-offset change or on every parent state change. At 142 evaluations per second during a phase when the user is not yet scrolling (cold start, no manual scrolling), this is excessive. Likely a candidate for `Equatable` view, `@StateObject` boundary, or `drawingGroup()` optimization.
+**Recommendation:** Validate in S2 (scroll + search) whether the rate increases proportionally with scroll velocity, or whether it stays roughly constant — if constant, the view is re-evaluating regardless of input, which is a clear bug.
+**Status:** To re-verify in S2 and S4 before filing upstream.
+
+---
+
+## F-RT-11: Scene/Navigation setup accumulates ~30-40 ms of main-thread work in cold start
+
+**Severity:** Low — individually small but sequential on main
+**Source:** Time Profiler Run 3 (`Bitwarden` PID 76119, 18.76 s aggregate weight)
+**Evidence:** Top self-weight Bitwarden symbols in Run 3:
+- `RootViewController.childViewController.didset` (BitwardenKit): 15 ms
+- `static UI.applyDefaultAppearances()` (BitwardenKit): 10 ms
+- `specialized SceneDelegate.scene(_:willConnectTo:options:)` (Bitwarden): 10 ms
+- `specialized SceneDelegate.buildSplashWindow(windowScene:)` (Bitwarden): 5 ms
+- `BitwardenTabBarController.setNavigators<A>(_:)` (BitwardenShared): 5 ms
+- `ViewLoggingNavigationController.viewDidLoad()` (BitwardenKit, INLINED): 5 ms
+- `Store.state.getter` (BitwardenKit): 5 ms
+**Hypothesis:** This is structural setup that must happen on main, but the per-step cost suggests opportunities to defer non-critical UI configuration (e.g., `applyDefaultAppearances` could potentially be invoked lazily on first appearance of each UIKit-bridged component rather than eagerly at app launch).
+**Recommendation:** Profile S4 (navigation cycles) to see whether `applyDefaultAppearances` or appearance-related work is re-invoked on tab/scene changes, which would amplify this cost.
+**Status:** Observational — file only if S4 confirms re-invocation pattern.
+
+---
+
+## F-RT-12: High variance of Threading metrics across runs (~50% CV) vs Allocations (<1.5% CV)
+
+**Severity:** Methodological — affects how many runs are needed for representative numbers
+**Source:** Cross-comparison of Allocations (3 runs, coefficient of variation < 1.5% on all reported metrics) vs Threading (3 runs, CPU total CV ≈ 50%, hang-count CV ≈ 60%).
+**Evidence:**
+- Allocations Heap & Anonymous VM persistent: 60.15 MiB ± 0.69 MiB across runs (CV ≈ 1.15%)
+- Threading Bitwarden CPU total Weight: 40.45 s / 14.62 s / 18.76 s (mean 24.6 s, std dev ≈ 13.8 s, CV ≈ 56%)
+- Threading Bitwarden hang count: 1 / 3 / 5 (mean 3, std dev 2, CV ≈ 67%)
+**Hypothesis:** Memory allocation is largely deterministic given the same app actions (same SDK init, same vault load), while threading and hang detection are sensitive to scheduler decisions, host system load, and simulator-level state pollution (see F-RT-08).
+**Recommendation:** When reporting threading findings, present them as ranges or qualitative patterns rather than as point estimates. For future audits where reproducibility is required, 5+ runs with simulator reset between each is the appropriate methodology, not 3.
+**Status:** Methodological note for the final report's Executive Summary.
+
+---
 
 ## Cross-cutting observations
 
