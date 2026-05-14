@@ -108,16 +108,62 @@ Three independent cold-start runs were executed per instrument, with the simulat
 
 ## S1 — Overdrawing analysis
 
-*Status: PENDING — to be completed via Color Blended Layers simulator toggle*
-
 ### Method
-Enable Simulator → Debug → Color Blended Layers, navigate to Vault list, capture screenshot. Areas rendered as red indicate opaque single-layer rendering (optimal); areas in green indicate blended layers (overdrawing — multiple semi-transparent surfaces stacked).
+Simulator → Debug → Color Blended Layers toggle enabled. Four key S1 surfaces captured: master-password lock screen, Vault list (scrolled to top), View Login item detail, and Generator tab. Convention: pixels rendered in red are opaque single-layer (one composition pass, optimal); pixels in green are blended (alpha-composited from multiple layers — overdrawing). Higher green saturation indicates more layers stacked per pixel.
 
-### Observations
-*To be captured.*
+### Captured surfaces
 
-### Problems and strengths
-*To be analyzed.*
+| Screenshot | Surface | File |
+|------------|---------|------|
+| Lock screen | `Verify master password` view | `s1_overdrawing_lock.png` |
+| Vault list (top) | `My Vault` favorites list | `s1_overdrawing_vault_top.png` |
+| Item detail | View Login (Airbnb item) | `s1_overdrawing_vault_item.png` |
+| Generator tab | Password generator view | `s1_overdrawing_tabbar.png` |
+
+All screenshots in `audit/profiling/screenshots/s1_overdrawing/`.
+
+### Observations by surface
+
+**Lock screen (`s1_overdrawing_lock.png`):**
+- Background of the entire screen renders green, including the large empty area below the `Unlock` button. SwiftUI containers are not marked `isOpaque`, so the screen background composes alpha with the layer behind it on every frame.
+- Title text (`Verify master password`), avatar circle (`GA`), and dots-menu icon all on green background.
+- Opaque (red) components: master-password input field, the info box (`Your vault is locked...`), and the Unlock button itself.
+- Net composition: ~70% of pixels are blended single-overlay; ~30% are correctly opaque.
+
+**Vault list scrolled to top (`s1_overdrawing_vault_top.png`):**
+- Top section (`My vault` header, search field, `FAVORITES (12)` section label) renders green.
+- Each row of the list is rendered as light pink/red (single-overlay with row tint), which is acceptable.
+- Tab bar (`My vault`, `Send`, `Generator`, `Settings`) renders strong red on the selected tab and pink on inactive tabs, indicating multi-layer composition on the tab bar specifically — the capsule background, blur, icon, and selected-state highlight stack on top of each other.
+- App icons (Airbnb, Amazon, Apple Music, etc.) display in natural colors → single-layer rendering for the icon assets themselves.
+
+**Item detail view (`s1_overdrawing_vault_item.png`):**
+- Most aggressive overdrawing observed of the four surfaces. Background is uniformly green; status-bar zone shows a brown/maroon tint, indicating the GPU is compositing more than two layers stacked at the top of the screen.
+- All cards (`LOGIN CREDENTIALS`, `AUTOFILL OPTIONS`, `ADDITIONAL OPTIONS`) render as light pink/red over green background → two-layer composition (card overlay + screen background blend).
+- Only the floating pencil-edit FAB and individual buttons (star, copy, eye) are correctly opaque.
+- Status-bar zone color shift is consistent with the modal being presented on top of the vault list without the underlying view being torn down — the GPU composes Vault list + modal status overlay + ItemDetail content on every frame.
+
+**Generator tab (`s1_overdrawing_tabbar.png`):**
+- Background green throughout.
+- Card containers (Password/Passphrase/Username selector, generated-password field, length/charset section) render light pink/red over green.
+- Interactive controls (Copy button in saturated red, toggles, +/− buttons) correctly opaque.
+- Tab bar pattern identical to Vault list: selected tab strong red, inactive pink.
+- The lower portion of the screen (around `Avoid ambiguous characters` and the tab bar) shows accumulated red intensity, suggesting additional layers in that region (likely the tab bar's blur/material background composing over the scroll content).
+
+### Problems
+
+| Problem | Surface(s) | Likely cause | Performance implication |
+|---------|------------|---------------|--------------------------|
+| Screen-wide transparent backgrounds | All four | SwiftUI containers default to non-opaque (`isOpaque = false`); developers did not annotate top-level backgrounds as opaque | GPU compositing on every frame even when content is static; battery and thermal cost in idle and amplified cost during animations |
+| Tab bar multi-layer composition | Vault list, Generator (and likely all main tabs) | Tab bar uses material blur + capsule background + selection highlight + icon, all stacked | Per-frame compositing cost concentrated in a 15% screen region; aggravated during tab transitions |
+| Item detail modal stacks over Vault list | `s1_overdrawing_vault_item.png` | Item detail presented as modal without tearing down the underlying vault list; both layers remain in the compositor tree | Highest per-frame cost of all S1 surfaces; visible only as battery/thermal drain, not user-visible glitch (until Core Animation hitches surface in S2/S3 measurements) |
+| Header zone alpha stacking | Lock, Vault list, Generator | Status bar overlay + screen header background not consolidated | Small per-frame cost but consistent across all screens |
+
+### Strengths
+
+- Interactive elements (buttons, input fields, toggles, icons, FAB) are consistently rendered as opaque single-layer surfaces — these are the touch targets and have correct rendering attributes.
+- App-icon assets (Airbnb logo, Amazon Prime logo, etc.) render as opaque single-layer, indicating image assets are properly pre-rendered without unnecessary alpha channels.
+- The Unlock button on the lock screen and the Copy button on the Generator render in saturated red, indicating fully opaque rendering for the primary CTAs.
+- No shadows, complex gradient overlays, or custom blur effects layered on top of content were observed; the overdrawing comes from default container behavior, not from intentional visual effects.
 
 ---
 
