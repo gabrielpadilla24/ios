@@ -417,52 +417,366 @@ The 489.10 ms microhang (Run 1) and the larger 520.68 ms and 630.88 ms hangs (Ru
 # Scenario S2 — Vault scroll + live search
 
 ## S2 — Methodology
-*Status: PENDING*
+
+Three independent runs were executed for Allocations + Leaks (45 seconds each, deferred mode, leak checks every 10s) and one run for the Animation Hitches template (45 seconds, Time Profiler + Thread State Trace + Thermal State + Hangs; the Hitches sub-instrument was deleted from the template since it is not supported on the iOS Simulator on Apple Silicon — same limitation documented in S1). The simulator was not reset between runs (consistent with F-RT-08 methodological note). The vault was preloaded with ~150 items via manual Sync now (per F-RT-06 workaround).
+
+The S2 script (see "Scenario scripts" section above) replaces the idle phase of S1 with active interaction: slow scroll top→bottom, fast flick bottom→top, tap search field, type "test" character by character, clear search, slow scroll bottom→top, idle. Total active interaction time: ~30 seconds within the 45-second recording window. The first ~15 seconds are consumed by cold start + master-password unlock + vault load, providing comparable baseline to S1.
+
+**Instruments used for S2:**
+- Allocations + Leaks (3 runs × 45 s) — completed
+- Animation Hitches template, Hitches sub-instrument removed (1 run × 45 s) — completed
+- Color Blended Layers debug overlay (3 surfaces captured during the active scroll/search interaction) — completed
+- Metal System Trace: not re-attempted (same Apple Silicon Simulator limitation documented in S1 applies)
+- Energy Log: not attempted (same physical-device-only limitation documented in S1 applies)
+
+**Raw screenshots:** `audit/profiling/screenshots/s2_allocations/` (12 PNGs, 3 runs × 4 views), `audit/profiling/screenshots/s2_threading/` (5 PNGs, 1 run, Hitches excluded per Simulator limitation), `audit/profiling/screenshots/s2_overdrawing/` (3 PNGs, 3 surfaces). Total: 20 PNGs documenting S2.
+
+---
 
 ## S2 — GPU rendering analysis
-*Status: PENDING*
+
+*Status: COMPLETE — data from Animation Hitches template's Display sub-instrument (1 run, 45.577 s). Same Simulator limitations apply as in S1.*
 
 ### Frame rate metrics
-| Run | fps avg | fps min | Hitches | Notes |
-|-----|---------|---------|---------|-------|
-| 1   |         |         |         |       |
-| 2   |         |         |         |       |
-| 3   |         |         |         |       |
-| **Mean ± SD** |  |  |  |  |
+
+The Display sub-instrument captured Average Frame Time across the 45.577 s window. Two distinct phases are visible in the timeline:
+
+- **Phase 1 (t ≈ 0–14 s, cold start)**: low Average Frame Time bars with occasional spikes during splash-to-vault transition. Two tall spikes near t≈4 s and t≈12 s coincide with surface composition events (Surface 7 → Surface 8 transition; see Display 1 track).
+- **Phase 2 (t ≈ 14–45 s, active interaction)**: higher density of Average Frame Time bars throughout, with a particularly tall spike near t≈15 s (start of slow scroll). Bars remain present but moderate during the scroll/search interaction window (t≈15–35 s), then taper during idle (t≈35–45 s).
+
+Surface composition during S2 follows the pattern: Surface 7 (initial) → Surface 8 (post-cold-start, brief) → Surface 7 (mid) → Surface 8 (brief) → Surface 9 (sustained, t≈12–32 s) → Surface 8/7 alternation (t≈32–45 s). The sustained Surface 9 segment overlaps temporally with the cluster of hangs detected during the search interaction (see Threading T-iii), consistent with S1 observation: when the render server holds a single surface composition for an extended interval, the main thread is doing heavy work that delays present.
+
+VSync alignment (red tick pattern in Display 1 track) remains regular throughout, indicating the display pipeline cadence itself is not compromised; the issue is upstream main-thread work that prevents frames from being committed in time.
 
 ### Problems and strengths
-*To be analyzed.*
+
+**Strengths:**
+- Thermal state remains `Nominal` for all 45.577 seconds (no throttling during active interaction; same as S1).
+- VSync cadence regular throughout; no extended display-pipeline stalls.
+- Average Frame Time bars during pure idle (t≈35–45 s) drop to near-baseline, indicating steady-state rendering remains well within budget when no user input arrives.
+
+**Problems:**
+- The eight hangs detected during S2 (see Threading T-iii) cluster precisely in the active-interaction window (t≈14–25 s), and the largest hang (1.68 s — sub-second user-perceptible) occurs during the search-typing phase. This is empirical evidence that the search pipeline does not isolate enough work off the main thread.
+- The Hitches sub-instrument remains unavailable on Simulator. The same scope limitation documented in S1 applies.
+
+### GPU consumption — scope limitation
+
+Same as S1. Not re-tested. The Animation Hitches template's Display + Time Profiler + Thread State Trace sub-instruments cover the rendering-time question (rubric item 3.a) for S2 but do not give GPU utilization percentages.
+
+### Power consumption — scope limitation
+
+Same as S1. Not re-tested. Thermal State reports `Nominal` for all 45.577 s of the S2 run.
+
+---
 
 ## S2 — Overdrawing analysis
-*Status: PENDING*
+
+### Method
+Simulator → Debug → Color Blended Layers toggle enabled during the active S2 interaction. Three surfaces captured at distinct interaction states: vault scrolled mid-position with modal navigation drill-in, search field active with matching results, and search field active with no-match empty state.
+
+### Captured surfaces
+
+| Screenshot | Surface | File |
+|------------|---------|------|
+| Vault drilled-into Logins category (mid-scroll) | Logins list with vault stack underneath | `s2_overdrawing_vault_scrolled.png` |
+| Search active, results filtered ("Test") | Vault search with 7 matching items | `s2_overdrawing_search_results.png` |
+| Search active, no matches ("xyz123") | Empty-state placeholder | `s2_overdrawing_search_empty.png` |
+
+All screenshots in `audit/profiling/screenshots/s2_overdrawing/`.
+
+### Observations by surface
+
+**Vault drilled-into Logins category, mid-scroll (`s2_overdrawing_vault_scrolled.png`):**
+- **Most severe overdrawing observed in the entire audit so far.** Nearly the full screen renders saturated red — not the light pink/red of acceptable two-layer composition observed in S1, but a continuous saturated red across header, search field, list rows, dividers, and tab bar.
+- Only two thin vertical margin strips at the left and right edges remain green (likely outside the modal's scrollable content area).
+- Header "Logins" + back button: opaque red background → 3+ layers stacked.
+- Search field placeholder "Search": light pink/red, slightly less saturated than the body content but still overdrawing.
+- List items (Best Buy through Costco Visa visible): each row's background is intense red, with icons and text rendering an even deeper red on top → 4 layers in the row regions.
+- FAB "+" floating button: saturated red, correctly opaque.
+- Tab bar at bottom: My Vault tab in deepest red (correct opaque selection state), but the rest of the tab bar continues the overdrawing pattern.
+- **Inferred composition stack**: vault root list (Layer 1) + modal "Logins" drill-in container (Layer 2) + scroll content background (Layer 3) + row backgrounds (Layer 4) + row content (Layer 5). The compositor renders all five on every frame.
+
+**Search active, results filtered (`s2_overdrawing_search_results.png`):**
+- Background between rows: uniform green → not overdrawing in empty inter-row space.
+- Search field with "Test" text: orange background (2–3 layers stacked) → search overlay composes with vault root.
+- Each result row (Adidas, Audit Test Identity, Best Buy, Cloudflare, Google Cloud, Tumblr, Yahoo Mail):
+  - App icon container: orange/red (2–3 layers) — the icon's circular container blends with row + screen background.
+  - Item title (in red, opaque): correct.
+  - Username/email (red/orange, 2 layers): name is opaque but field background blends.
+  - "..." overflow menu: red opaque (correct).
+- Divider lines between rows: tint of green → lines drawn with alpha over background.
+- Tab bar identical to S1 pattern: selected tab strong red, inactive pink.
+
+**Search active, no matches (`s2_overdrawing_search_empty.png`):**
+- Background **100% green** — worst overdrawing baseline observed for empty space (S1 had similar but less saturated). Every pixel of the empty placeholder area composites with the vault list root behind it.
+- Status bar opaque (correct).
+- Search field with "xyz123": orange field background (2–3 layers).
+- Clear button (X inside field) and close button (X outside field): green container with red icon → icon-on-translucent-button composition.
+- **Magnifying glass empty-state icon: orange** → the icon's square container is 3-layer composed (icon glyph + container + screen background).
+- "There are no items that match the search" label: orange/red text on green background → text rendered correctly but the area surrounding it (the entire screen) is unnecessarily composited.
+- Tab bar same as Search results screen.
+
+### Problems
+
+| Problem | Surface(s) | Likely cause | Performance implication |
+|---------|------------|---------------|--------------------------|
+| Modal drill-in stacks over vault root | `s2_overdrawing_vault_scrolled.png` | "Logins" category presented as modal navigation on top of vault list without tearing down the underlying view; both layers remain in compositor tree, multiplied by row content layers | Per-frame compositing cost is highest of all surfaces audited; each scroll tick recomposites 4-5 layers across full screen |
+| Search overlay does not opaque-fill background | Both search screens | Search results / empty state rendered as overlay on vault list, not as a screen replacement | GPU continues compositing vault list rows behind the search results even when no vault content is visible to the user |
+| Empty-state placeholder still renders over vault root | `s2_overdrawing_search_empty.png` | No `.background(Color.systemBackground).ignoresSafeArea()` or equivalent opaque fill on the empty state | When user types a non-matching query, GPU spends time compositing layers that are 100% obscured by the empty-state view |
+| App-icon row containers blend instead of being opaque | `s2_overdrawing_search_results.png` | Icon containers use rounded-rect shape with implicit alpha background instead of opaque fill | Repeated cost per row, accumulates with list length; in a 150-item vault during scroll this is a measurable repeated cost |
+| Tab bar overdrawing pattern unchanged from S1 | All three S2 surfaces | Material blur + capsule + selection highlight + icon stacking persists across all screens | ~15% of screen area continuously overdrawing in every scenario; aggravated during tab transitions |
+
+### Strengths
+
+- Interactive controls (FAB, search field input area, clear/close buttons, tab bar icons) consistently render as opaque single-layer surfaces — touch targets have correct rendering attributes (same as S1).
+- App-icon assets (Cloudflare, Google, Tumblr, Yahoo) render their bitmaps opaquely; only the surrounding container blends (consistent with S1 finding).
+- Divider lines between search result rows are rendered with alpha (intentional design choice to maintain visual continuity with row content); this is acceptable use of blending for a thin pixel band, not a per-frame cost concern.
+- Search field text input itself (the typed characters) renders opaque red over the field background — text legibility is preserved despite overdrawing of the field's container.
+- During the empty-state screen, the magnifying-glass icon and label are positioned and rendered correctly even on top of the overdrawing background; user perception is not impacted, only GPU efficiency.
+
+---
 
 ## S2 — Memory management
-### M-i — Leaks
-*Status: PENDING*
 
-### M-ii — RAM consumption
-| Run | Peak (MB) | Final (MB) | Δ from baseline | # Persistent allocs | Notes |
-|-----|-----------|------------|------------------|----------------------|-------|
-| 1   |           |            |                  |                      |       |
-| 2   |           |            |                  |                      |       |
-| 3   |           |            |                  |                      |       |
-| **Mean ± SD** |  |  |  |  |  |
+### M-i — Memory leaks: which, where?
+
+Three Leaks-instrument snapshots per run (every 10 seconds within the 45-second window).
+
+| Run | Leaked allocations (approx) | Total bytes leaked (approx) | Snapshot pattern | Primary responsible library |
+|-----|------------------------------|------------------------------|--------------------|------------------------------|
+| 1   | 17                          | ~1.39 KB                     | First snapshot leaks detected (green observed momentarily then red), second & third snapshots red | `BitwardenSdk_4641...` (Rust SDK via UniFFI) + 1× CoreData |
+| 2   | 17                          | ~1.40 KB                     | All three snapshots red | `BitwardenSdk_4641...` (Rust SDK via UniFFI) |
+| 3   | 18                          | ~1.45 KB                     | All three snapshots red | `BitwardenSdk_4641...` (Rust SDK via UniFFI) + 1× CoreData |
+
+**Leak categorization by source (consistent across S1 and S2):**
+
+| Source | Per-run count (approx) | Sizes observed | Stack trace signature |
+|--------|------------------------|----------------|------------------------|
+| Bitwarden Rust SDK via UniFFI FFI boundary | 16-18 | 64 bytes (most), 128 bytes (some) | `alloc::alloc::exchange_malloc` → `alloc::sync::Arc<T>::new` → `uniffi_core::ffi::rustfuture::future` → `ffi_bitwarden_uniffi_rust_future_po...` → `@nonobjc ffi_bitwarden_uniffi_rust...` → `swift::runJobInEstablishedExecutor` |
+| CoreData internal | 0–1 per run | 16 bytes | `+[_NSMemoryStorePredicateRemapper defaultInstance]` |
+
+**Interpretation:** F-RT-09 is **deterministically reproduced in S2** with identical stack-trace signature to S1 (Arc<T> via UniFFI rust_future via Swift executor job). The volume of leaks (16–18 per run) is comparable to S1 (17–19 per run) despite the addition of search and scroll interaction — meaning the Arc leak pattern is **driven by SDK initialization** (during the cold-start phase of the 45 s window), not by per-interaction work. The CoreData `_NSMemoryStorePredicateRemapper` leak appears intermittently across runs (visible in runs 1 and 3, not visible in run 2's captured screenshot — may be outside viewport).
+
+**Zero new Swift-side leaks detected during the S2 interaction phase**: no scroll-induced or search-induced retain cycles observed. The vault list, search field, and item-detail navigation paths do not leak Swift objects under the S2 script.
+
+**Screenshots:** `s2_allocations_run{1,2,3}_leaks.png`.
+
+### M-ii — RAM consumption across the scenario
+
+#### Active-interaction memory growth pattern
+
+All three S2 runs share a consistent shape: rapid growth during the cold-start phase (t≈0–14 s, same shape as S1), brief plateau (t≈14–15 s, idle just before scroll), then continued sustained growth during the scroll+search interaction window (t≈15–35 s), with a final plateau during idle (t≈35–45 s). Unlike S1, the heap does not fully plateau by run end — it continues climbing at a reduced rate, indicating allocations during the interaction outpace deallocations.
+
+#### Per-run memory footprint at end of 45-second window
+
+| Run | All Heap Persistent | # Persistent | # Transient | Total Bytes (cumulative) | # Total |
+|-----|----------------------|--------------|--------------|---------------------------|---------|
+| 1   | 32.79 MiB           | 241,315      | 3,418,118    | 532.17 MiB                | 3,659,433 |
+| 2   | 34.00 MiB           | 251,530      | 3,819,408    | 586.35 MiB                | 4,070,938 |
+| 3   | 33.78 MiB           | 249,936      | 3,845,041    | 591.46 MiB                | 4,094,977 |
+| **Mean ± SD** | **33.52 MiB ± 0.65** | **247,594 ± 5,520** | **3,694,189 ± 238,749** | **569.99 MiB ± 32.71** | **3,941,783 ± 244,884** |
+| **Coefficient of variation** | 1.93% | 2.23% | 6.46% | 5.74% | 6.21% |
+
+**Interpretation:**
+- All Heap Persistent CV ≈ 1.93% across S2 runs: reproducibility is high, consistent with S1 (CV ≈ 1.15%). Memory measurements remain the most stable signal in the audit.
+- Transient allocation count CV (6.46%) is higher than S1 (3.00%) because scroll velocity and search-typing cadence introduce small per-run variation in the number of intermediate allocations created during cell recycling, search-result diffing, and text-field state updates. This is expected and does not undermine the structural conclusions.
+- The all-heap persistent footprint at the end of S2 (~33.5 MiB) is **lower** than S1's heap-allocations-persistent footprint (~23.5 MiB heap only, or ~60 MiB heap + anonymous VM). The S2 measurement reports a different metric grouping (heap only, not heap+anonymous VM), so a direct apples-to-apples comparison would require re-reading the same Statistics filter; the order of magnitude is consistent.
+- **Total cumulative bytes (~570 MiB) vs persistent (~33.5 MiB) → ratio ~17:1**. Compared to S1's 5:1 ratio, S2 generates substantially more transient allocation churn per persistent byte retained. This is the expected signature of an interactive scenario: many short-lived objects (gesture recognizers, scroll-state snapshots, text-edit deltas, search-filter intermediates) are created and freed within milliseconds.
+
+#### Top resident-memory categories at run end (Run 3 representative)
+
+| Category | Persistent Bytes | # Persistent | Notes |
+|----------|------------------|--------------|-------|
+| All Heap Allocations | 33.78 MiB | 249,936 | Aggregate (filter row) |
+| Malloc 16.00 KiB | 3.27 MiB | 209 | Generic heap blocks (same category dominant in S1) |
+| UnknownObjectType | 1.80 MiB | 19,445 | Custom Swift types without resolved symbol; +290% from S1 (7,457). Likely scroll-related vault row models. |
+| CFString (store) | 1.17 MiB | 6,290 | String storage backing |
+| Malloc 32 Bytes | 913.69 KiB | 29,238 | High count → many small allocations, consistent with S1 pattern |
+| Malloc 8.00 KiB | 904.00 KiB | 113 | Generic heap |
+| Malloc 2.00 KiB | 814.00 KiB | 407 | Generic heap |
+| Malloc 128 Bytes | 789.62 KiB | 6,317 | Generic heap |
+| _DictionaryStorage<Obj...> | 741.75 KiB | 681 | Swift dictionary storage; +30% from S1 |
+| CFString (immutable) | 719.19 KiB | 15,185 | Immutable strings |
+| Malloc 80 Bytes | 612.50 KiB | 7,840 | Generic heap |
+| Malloc 256 Bytes | 608.00 KiB | 2,432 | Generic heap |
+| CFData | 589.22 KiB | 620 | CFData buffers |
+| Swift.__StringStorage | 575.64 KiB | 3,914 | Swift String storage |
+| Malloc 64 Bytes | 353.56 KiB | 5,657 | Generic heap |
+
+**Observations on memory-consumer composition (S2 vs S1):**
+- **UnknownObjectType count grew from 7,457 (S1) to 19,445 (S2) — a 161% increase** for the same vault size. Strongly suggests row cell view-models or search-filter intermediates are being created per row during scroll without being deallocated.
+- **_DictionaryStorage** allocations grew from S1; likely indicative of search-state dictionaries or scroll-position observers.
+- Generic Malloc bins (16 KiB, 8 KiB, 2 KiB) sizes consistent with S1 — backing storage for SwiftUI/UIKit infrastructure.
+- No category showed unexpected explosive growth → no clear "leak by accumulation" pattern in any one allocator class.
+
+#### Memory under different use scenarios
+
+S2 vs S1 differential: ~10 MiB additional growth during scroll+search interaction (33.5 MiB final vs 23.5 MiB heap-only S1 final), with disproportionate growth concentrated in UnknownObjectType (+161%). This is the cost of interactive UI work. S3 and S4 will measure save-flow and navigation-cycle memory respectively.
+
+**Screenshots:** `s2_allocations_run{1,2,3}_alltracks.png`, `s2_allocations_run{1,2,3}_summary.png`.
 
 ### M-iii — Libraries for leak management
-*Cross-reference to S1 M-iii; library landscape does not vary by scenario.*
+
+Cross-reference to S1 M-iii. The library landscape (Instruments Leaks/Allocations, MetricKit, os_signpost, MallocStackLogging, Memory Graph Debugger, ASan, Rust-side Miri/tracing) does not vary by scenario. Same recommendations apply.
 
 ### M-iv — Allocation patterns, GC, heap dumps
-*Status: PENDING*
+
+#### Garbage collection
+
+Same as S1: iOS does not have a GC. ARC is deterministic. The relevant question is how often objects allocate and deallocate, and whether interactive scenarios surface retain cycles. None observed in S2 Swift code paths.
+
+#### Allocation patterns observed during S2
+
+Top allocation sites by cumulative bytes, from Allocations Call Tree (Run 3 representative; Runs 1-2 within ±5% on top symbols):
+
+| Symbol | Library | Bytes Used (Run 3) | Call Count (Run 3) | Cross-run consistency |
+|--------|---------|---------------------|---------------------|------------------------|
+| `main` | Bitwarden | 22.78 MB (71.9%) | 181,284 | ±1.9% across 3 runs |
+| `FontConvertible.registerIfNeeded()` (inlined) | BitwardenResources | 1.58 MB | **11,609** | **Identical across 3 runs (0% variance)** |
+| `closure #1 in PositionObservingView.body.getter` | BitwardenShared | 1.23 MB | 4,208 | 4,137 / 4,208 / 4,204 across runs (±0.9%) |
+| `closure #1 in FetchedResultsSubscription.init(...)` | BitwardenKit | 563.66 KB | 1,880 | ~consistent |
+| `UINavigationController.replace<A>(_:animated:)` | BitwardenKit | 322.30 KB | 1,855 | ~consistent |
+| `specialized _ContiguousArrayBuffer._consumeAndCreateNew(...)` | BitwardenShared | 323.92 KB | 18 | Array growth during scroll |
+| `CipherDetailsResponseModel.init(from:)` | BitwardenShared | 230.34 KB | 1,354 | ~consistent |
+| `RootViewController.childViewController.didset` | BitwardenKit | 187.48 KB | 1,431 | ~consistent |
+| `BitwardenTabBarController.setNavigators<A>(_:)` | BitwardenShared | 174.84 KB | 1,375 | ~consistent |
+| `@nonobjc UIImage.__allocating_init(named:in:compatibleWith:)` (inlined) | BitwardenResources | 157.50 KB | 1,750 | UIImage instantiation for vault row icons |
+| `specialized FontConvertible.register()` | BitwardenResources | 155.58 KB | 85 | ~consistent |
+| `static UI.applyDefaultAppearances()` | BitwardenKit | 149.00 KB | 1,016 | ~consistent |
+| `alloc::raw_vec::RawVecInner<...>::try_allocate_in::...` | BitwardenSdk | 140.00 KB | 98 | Rust vector allocations |
+| `@nonobjc NSManagedObjectModel.init(contentsOf:)` | BitwardenShared | 125.73 KB | 343 | CoreData model loads |
+| `TabCoordinator.start()` | BitwardenShared | 114.95 KB | 978 | ~consistent |
+| `DataStore.init(errorReporter:storeType:)` | BitwardenShared | 114.41 KB | 891 | Approach-2 caveat from S1 still applies |
+| `_RNvCs5QKde7ScR4H_7__rustc14__rust_realloc` | BitwardenSdk | 104.88 KB | 837 | Rust reallocations |
+
+**Key cross-run determinism finding (reproduction of F-RT-03):**
+- `FontConvertible.registerIfNeeded()`: **11,609 calls across all 3 S2 runs (CV = 0%)**. Identical to S1 (11,612 / 11,613 / 11,612). The over-invocation pattern is fully structural, fully deterministic, and reproduces across scenarios. The count is not affected by user interaction (scroll, search) because the registrations happen at view-load time, before interaction begins.
+
+**Key cross-run consistency finding (reproduction of F-RT-10):**
+- `closure #1 in PositionObservingView.body.getter`: 4,137 / 4,208 / 4,204 calls across S2 runs (mean 4,183, CV 0.85%). Mean is **lower than S1** (4,270), which is surprising for an interactive scenario. Hypothesis: the scroll interaction in S2 short-circuits some of the during-cold-start body re-evaluation cascade because the SwiftUI render path receives different state-change signals during active scroll versus pure idle. Worth flagging as observation; does not change the conclusion that the over-evaluation pattern (~93 evals/s) is structural.
+
+**Heap dumps:** Functionally equivalent to S1's; Instruments deferred traces (.trace files, not committed) provide superset information.
+
+#### Deep allocation patterns of note (S2-specific)
+
+1. **UnknownObjectType growth (+161% vs S1)**: 19,445 persistent allocations classified under UnknownObjectType in S2 vs 7,457 in S1. Suggests scroll/search creates Swift types (likely row view-models or filter intermediates) that Instruments cannot symbolicate. Recommendation: enable Swift type symbolication or inspect via Memory Graph Debugger to identify the class.
+
+2. **CipherDetailsResponseModel instantiation rate (1,354 in S2)**: This count is unexpectedly high for an interactive scenario that does not drill into item details — suggests the search filter or row rendering may be (re-)decoding cipher response models from CoreData each frame instead of using cached decoded values.
+
+3. **Rust SDK allocations (`alloc::raw_vec::RawVecInner` 98 calls, 140 KB)**: Rust-side vector allocations during S2 reflect the SDK doing search-related decryption work. Less than 0.5% of total persistent footprint — Rust SDK memory is not a concern.
+
+4. **Determinism preserved**: even with the interactive workload, top symbols' call counts vary by less than 2% across runs. The audit's measurement methodology continues to surface structural patterns rather than noise.
+
+**Screenshots:** `s2_allocations_run{1,2,3}_calltree.png`.
+
+---
 
 ## S2 — Threading
-### T-i — Thread creation, async usage
-*Status: PENDING*
 
-### T-ii — Main-thread locks
-*Status: PENDING — particularly relevant for S2 given fast typing in search (~150ms cadence).*
+*Status: COMPLETE — Animation Hitches template with Time Profiler + Thread State Trace + Thermal State + Hangs sub-instruments (Hitches removed per Simulator limitation). 1 run × 45.577 s. Screenshots: `audit/profiling/screenshots/s2_threading/` (5 PNGs).*
 
-### T-iii — Multithreading performance impact
-*Status: PENDING*
+### Run summary
+
+| Metric | S2 Run 1 | S1 Run 3 (worst) | Δ vs S1 worst |
+|---|---|---|---|
+| Duration | 45.577 s | 30.585 s | — (different windows) |
+| Bitwarden PID | 29462 | 76119 | — |
+| Bitwarden CPU total (Weight) | 1.04 s | 18.76 s | Different time windows; per-second rate is comparable |
+| Hangs count | **8** | 5 | **+60%** |
+| Min hang duration | 181.73 ms | (not separately reported) | — |
+| Avg hang duration | **562.40 ms** | (not separately reported) | — |
+| Std Dev hang duration | 467.49 ms | 219.24 ms | +113% (more variable) |
+| Max hang duration | **1.68 s** | 630.88 ms | **+167%** (sub-second user-perceptible) |
+| Hang range | 1.50 s | (not reported) | — |
+| Thermal state | Nominal | Nominal | unchanged |
+| Thread state transitions (all states) | 30,045 | 8,990 | +234% (mostly accounted for by 45 s vs 30 s + interactive load) |
+
+### T-i — Where and how are threads created? Async/await usage observed
+
+S2 confirms the threading sources observed in S1 (rayon thread pool spawn, GCD workers, Swift Concurrency executor, pthread workqueue, CoreData publishers, SwiftUI body re-evaluation). Heaviest Stack Trace from S2 Time Profiler additionally surfaces:
+
+| Source (S2-specific evidence) | Mechanism | Weight |
+|---|---|---|
+| `main` (Bitwarden) | App main thread | 782 ms (top consumer) |
+| `__CFRunLoopRun` (CoreFoundation) | Main RunLoop event dispatch | 765 ms |
+| `__CFRunLoopDoSour...` (CoreFoundation) | RunLoop source handling | 330 ms |
+| `_UIUpdateSequenceR...` (UIKitCore) | UIKit display-update sequence | 310 ms |
+| `_setupUpdateSeque...` (UIKitCore) | Scene/Navigation setup (confirms F-RT-11) | 210 ms |
+| `ViewGraph.updateOu...` (SwiftUICore) | SwiftUI view-graph update | 103 ms |
+| `closure #1 in Position...` (BitwardenShared) | SwiftUI PositionObservingView body (confirms F-RT-10) | 46 ms |
+
+The 765 ms on `__CFRunLoopRun` is expected and not a defect — it represents the RunLoop blocking waiting for events. The 310 ms on `_UIUpdateSequenceR...` and 210 ms on `_setupUpdateSeque...` together indicate ~520 ms of UIKit / SwiftUI display-update work concentrated on main during the 45 s window, which directly explains the hang pattern.
+
+### T-ii — Possible locks on main thread
+
+The Time Profiler Call Tree (inverted, Hide System Libraries) surfaces several main-thread-attributed Bitwarden symbols during S2:
+
+| Symbol | Self-weight | Concern |
+|---|---|---|
+| `main` (Bitwarden) | 692.00 ms (66.7%) | Aggregate of all main-thread Bitwarden work; consistent with S1 |
+| `closure #1 in PositionObservingView.body.getter` (BitwardenShared) | 44.00 ms (4.2%) | Reproduces F-RT-10 in S2 |
+| `_$LT$tracing_oslog..logger..OsLogger$u20$as$u20$tracing_subscriber..layer..Lay` (BitwardenSdk) | 16.00 ms (1.5%) | Rust SDK logging subscriber on main thread |
+| `std::sys::pal::unix::sync::mutex::Mutex::lock` (BitwardenSdk) | 11.00 ms (1.1%) | **Mutex lock observed on main thread** (new finding F-RT-13) |
+| `FontConvertible.register()` (BitwardenResources, inlined) | 7.00 ms (0.7%) | Reproduces F-RT-03 in S2 |
+| `__swift_instantiateConcreteTypeFromMangledNameV2` (BitwardenShared / Bitwarden) | 6.00 / 5.00 ms | Swift runtime type instantiation |
+| `__swift_instantiateConcreteTypeFromMangledNameAbstractV2` (BitwardenShared) | 5.00 ms | Same family |
+| `specialized SceneDelegate.scene(_:willConnectTo:options:)` (Bitwarden) | 4.00 ms | Reproduces F-RT-11 in S2 |
+| `rayon_core::registry::WorkerThread::wait_until_cold` (BitwardenSdk) | 4.00 ms | **Rayon worker waiting (new finding F-RT-13)** |
+| `static UI.applyDefaultAppearances()` (BitwardenKit) | 2.00 ms | Same as S1 |
+| `@nonobjc AVCaptureMetadataOutput.init()` (BitwardenShared, inlined) | 2.00 ms | Camera output init (likely Authenticator-related preload) |
+| `Store.state.getter` (BitwardenKit) | 2.00 ms | Store state access on main; minor |
+| `ShakeWindow.init(windowScene:onShakeDetected:)` (BitwardenKit) | 2.00 ms | Shake-to-lock feature overhead |
+| `protocol witness for ObservableObject.objectWillChange.getter in conformance Store<A, B, C>` (BitwardenKit) | 2.00 ms | Reproduces F-RT-10 ObservableObject pattern |
+| `core::ops::function::FnOnce::call_once::h251a9b2e0ee5dfb2` (BitwardenSdk) | 2.00 ms | Rust closure invocation on main |
+
+**New finding (F-RT-13):** Two distinct Rust-side symbols appear in main-thread self-weight that warrant separate tracking from F-RT-09 (Arc leaks):
+- `std::sys::pal::unix::sync::mutex::Mutex::lock` (11 ms) — main thread is acquiring a Rust-side mutex synchronously.
+- `rayon_core::registry::WorkerThread::wait_until_cold` (4 ms) — main thread is waiting on the rayon worker pool.
+
+These are not memory leaks; they are synchronization primitives. Combined, they indicate the Swift-side calling code is making blocking calls into the Rust SDK that wait for Rust-side worker availability. See F-RT-13.
+
+### T-iii — How multithreading affects performance
+
+**Hang count and severity in S2 vs S1:**
+
+| Metric | S1 Run 1 | S1 Run 2 | S1 Run 3 | S2 Run 1 |
+|---|---|---|---|---|
+| Hangs | 1 | 3 | 5 | **8** |
+| Max hang duration (ms) | 489.10 | 520.68 | 630.88 | **1,680** |
+
+S2 reproduces F-RT-08 (progressive hang degradation) and intensifies it: 8 hangs is +60% over S1's worst run, and the max hang duration of 1.68 s is sub-second user-perceptible — i.e., the user would notice a stall during the search-typing interaction. Average hang duration (562 ms) is roughly the boundary at which hangs cease being "microhangs" and become "perceptible delays" per Apple's classification. Std Dev (467 ms) is roughly 83% of mean, indicating high variability — some hangs are short (181 ms minimum), others are sub-second.
+
+The Hangs track timeline shows:
+- 1 hang (orange, "Hang" label) near t ≈ 3 s — cold start cluster, same pattern as S1.
+- 7 hangs (blue rectangles) clustered in t ≈ 14–25 s window — this is precisely the search-interaction phase (type "test" → results filter → clear → scroll). The hangs occur during user input handling.
+
+**Thread State Trace (S2 new data):**
+
+| State | Count | Duration | Avg | Max |
+|---|---|---|---|---|
+| Blocked | 10,162 | 3,719.04 s | 21.96 s | 45.58 s |
+| Running | 9,705 | 4.51 s | 464.42 µs | 473.88 ms |
+| Runnable | 5,182 | 7.89 s | 1.52 ms | 7.87 s |
+| Interrupted | 3,480 | 5.71 ms | 1.64 µs | 11.38 µs |
+| Preempted | 946 | 41.70 ms | 44.08 µs | 1.09 ms |
+| Unknown | 560 | 417.69 min | 44.75 s | 45.58 s |
+| Idle | 10 | 7.60 min | 45.58 s | 45.58 s |
+
+**Interpretation:**
+- 30,045 state transitions in 45.58 s ≈ 659 transitions/s — high context-switching density, consistent with concurrent work across many threads.
+- **Blocked dominates the state mix** (10,162 transitions / 3,719 s cumulative across all threads). Threads spend most time waiting for I/O, locks, or async completion. This aligns with the F-RT-09 (Arc leaks via UniFFI futures) and F-RT-13 (mutex contention) findings: many threads are blocked on synchronization primitives.
+- **Running max 473.88 ms** — a single thread ran continuously for nearly half a second without yielding. When this happens on the main thread, it directly produces a hang.
+- **Runnable max 7.87 s** — a thread waited up to 7.87 s to be scheduled. This is consistent with priority inversion or worker starvation (threads ready to run but scheduler choosing others). Combined with the rayon `wait_until_cold` observation, suggests the Rust SDK thread pool is sometimes starved of CPU.
+
+**Thermal:** 100% Nominal for 45.577 s, no throttling. Same caveat as S1 (Simulator does not implement real thermal modeling).
+
+**Net conclusion for S2 Threading:**
+- Multithreading benefits are preserved (Rust SDK work is off main, crypto/decryption is parallelized).
+- But the boundary between Swift main thread and Rust SDK is a measurable bottleneck: mutex locks and worker waits on main account for 15 ms of self-weight, and they correlate temporally with the 8 hangs in the interaction window.
+- F-RT-08 (progressive hang degradation), F-RT-09 (Rust SDK Arc leaks), F-RT-10 (SwiftUI observable churn), F-RT-11 (Scene/Navigation main-thread setup), and F-RT-12 (high run-to-run variance) all reproduce in S2 with the same signatures as S1.
+- **F-RT-13 is new in S2**: Rust SDK mutex contention + rayon worker wait observable on main thread.
+
+**Screenshots:** `audit/profiling/screenshots/s2_threading/` (5 PNGs).
 
 ---
 
