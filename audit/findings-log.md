@@ -4,7 +4,7 @@ Findings observed during runtime setup of the audit fork (free Apple Developer a
 These will be triaged into final report sections (§8 Memory, §9 ECn/Robustness, §13 Optimizations) after profiling completes.
 
 - Audit commit: 5218b7f21bce14622b823e41e844844aeedd593b
-- Date: 2026-05-13 (initial setup) / 2026-05-14 (Approach 2 persistence-fidelity refinement)
+- Date: 2026-05-13 (initial setup) / 2026-05-14 (Approach 2 persistence-fidelity refinement) / 2026-05-15 (S2 profiling)
 - Environment: macOS, Xcode 26.5, free-tier Apple Developer Team U67Q3MTU2M
 - Custom bundle ID: com.gabrielpadilla24.bwaudit.passwordmanager
 
@@ -41,6 +41,7 @@ These will be triaged into final report sections (§8 Memory, §9 ECn/Robustness
 - **Hypothesis:** The same font file is either bundled in multiple frameworks (main app + BitwardenShared + BitwardenResources), or the registration happens multiple times during framework initialization.
 - **Impact:** Not blocking, but indicates redundant resource loading and minor app startup overhead.
 - **Suggested upstream fix:** Centralize font registration in one framework, or guard the registration call with a per-process flag.
+- **Reproduction in S2:** FontConvertible.registerIfNeeded() observed **11,609 calls across all 3 S2 runs (CV = 0%)**. Identical to S1 (11,612 / 11,613 / 11,612). The over-invocation pattern is fully structural and deterministic; not affected by user interaction (scroll, search), confirming registrations happen at view-load time rather than per-interaction.
 - **Category:** Resource loading anti-pattern.
 
 ---
@@ -98,6 +99,7 @@ These will be triaged into final report sections (§8 Memory, §9 ECn/Robustness
 - **Category:** Entitlement-coupled persistence + Robustness.
 
 ---
+
 ## F-RT-08: Progressive hang degradation across consecutive Instruments runs without simulator reset
 
 **Severity:** Methodological (does not affect end users; affects measurement reproducibility)
@@ -105,7 +107,8 @@ These will be triaged into final report sections (§8 Memory, §9 ECn/Robustness
 **Evidence:** Run 1 reported 1 hang (489.10 ms microhang). Run 2 reported 3 hangs (max 520.68 ms, std dev 237.00 ms). Run 3 reported 5 hangs (max 630.88 ms, std dev 219.24 ms). The app was terminated and freshly relaunched between runs (`xcrun simctl terminate` followed by fresh launch from Xcode/Instruments), but the simulator and host environment were not reset.
 **Hypothesis:** Simulator-level state (FS snapshots, daemon caches, WindowServer composition state, possibly Instruments' own deferred recording state) accumulates between runs and increases the probability of main-thread stalls being detected.
 **Recommendation:** For S2-S4 and for fragmentation runs, document whether the simulator was reset between runs; if measurement reproducibility is the goal, the simulator should be shutdown and re-booted between runs, not merely the app terminated. For end-user impact analysis, the as-tested behavior is closer to "second/third cold start of the day" and is therefore representative of a worst-case real-world condition.
-**Status:** Methodological note, no upstream issue.
+**Reproduction in S2 (intensified):** S2 run 1 produced **8 hangs** with max duration **1.68 s** — +60% in count and +167% in max duration vs S1's worst run (Run 3, 5 hangs / 630.88 ms max). Avg hang duration in S2 was 562.40 ms, std dev 467.49 ms. 7 of the 8 S2 hangs cluster temporally within the search-interaction window (t ≈ 14–25 s), demonstrating the progression is not just a function of consecutive runs but also of interactive workload introduced into the run. The max hang of 1.68 s crosses the sub-second user-perceptible threshold — at that duration, the user would notice a stall during the search-typing interaction.
+**Status:** Methodological note, no upstream issue. S2 confirms the pattern is environmental (simulator state) AND workload-amplified (interaction increases stall probability).
 
 ---
 
@@ -115,7 +118,8 @@ These will be triaged into final report sections (§8 Memory, §9 ECn/Robustness
 **Source:** Time Profiler Run 1 (BitwardenSdk_PackageProduct `sha2::sha256::compress256` 35 ms self-weight) and Run 2 (com.apple.kec.corecrypto `AccelerateCrypto_SHA256_compress` 15 ms self-weight). Both symbols appear in Bitwarden's self-weight, meaning the work is being attributed to Bitwarden threads.
 **Hypothesis:** The Rust SDK performs vault decryption / key derivation using its own pure-software SHA-256, while iOS keychain access or biometric attestation calls Apple's accelerated SHA-256 path. If the same input is being hashed twice (once per pipeline), there is room to consolidate.
 **Verification needed:** Open call-tree leaves of both symbols on a physical device run to confirm whether the input data overlaps. Pure-software SHA-256 in `BitwardenSdk` is expected (the SDK is platform-independent and bundles its own crypto for portability); this finding flags it as a candidate for *optional* native-crypto bridging if the upstream maintainers consider portability acceptable.
-**Status:** Candidate for upstream discussion; not yet filed.
+**Reproduction in S2:** 16-18 Arc leaks per run across all 3 S2 runs with identical stack-trace signature to S1 (`alloc::sync::Arc<T>::new` → `uniffi_core::ffi::rustfuture::future` → `ffi_bitwarden_uniffi_rust_future_po...` → `swift::runJobInEstablishedExecutor`). Leak volume is comparable to S1 (17-19 per run) despite adding scroll+search interaction, confirming the leak pattern is **driven by SDK initialization during cold start**, not by per-interaction async work. CoreData `_NSMemoryStorePredicateRemapper` leak also reproduces (S2 runs 1 & 3).
+**Status:** Candidate for upstream discussion; not yet filed. F-RT-13 (new in S2) documents the related synchronous mutex/wait pattern at the same Swift↔Rust boundary.
 
 ---
 
@@ -130,7 +134,8 @@ These will be triaged into final report sections (§8 Memory, §9 ECn/Robustness
 - `closure #1 in SearchableVaultListView.search.getter` (BitwardenShared): 5 ms self-weight (Run 1)
 **Hypothesis:** `PositionObservingView` is a scroll-position-tracking view that may be re-evaluating its body on every scroll-offset change or on every parent state change. At 142 evaluations per second during a phase when the user is not yet scrolling (cold start, no manual scrolling), this is excessive. Likely a candidate for `Equatable` view, `@StateObject` boundary, or `drawingGroup()` optimization.
 **Recommendation:** Validate in S2 (scroll + search) whether the rate increases proportionally with scroll velocity, or whether it stays roughly constant — if constant, the view is re-evaluating regardless of input, which is a clear bug.
-**Status:** To re-verify in S2 and S4 before filing upstream.
+**Reproduction in S2:** `closure #1 in PositionObservingView.body.getter` reproduced with 4,137 / 4,208 / 4,204 evaluations across 3 S2 runs (mean 4,183, CV 0.85%, ~93 evals/s sustained). Self-weight on main thread: 44 ms (4.2%) in S2 Time Profiler. The S2 rate is **lower** than S1 (4,270, ~142/s) — counterintuitive for an interactive scenario. Hypothesis: during active scroll the SwiftUI render path receives different state-change signals than pure idle, short-circuiting some cascade re-evaluations. Pattern confirmed structural across both scenarios — the view re-evaluates regardless of whether user is scrolling, which is the bug originally hypothesized in S1. S2 strengthens the case for filing upstream because the over-evaluation persists across two distinct workloads.
+**Status:** Confirmed in S2. Re-verify quantitatively in S4 (navigation cycles) before filing upstream.
 
 ---
 
@@ -148,7 +153,8 @@ These will be triaged into final report sections (§8 Memory, §9 ECn/Robustness
 - `Store.state.getter` (BitwardenKit): 5 ms
 **Hypothesis:** This is structural setup that must happen on main, but the per-step cost suggests opportunities to defer non-critical UI configuration (e.g., `applyDefaultAppearances` could potentially be invoked lazily on first appearance of each UIKit-bridged component rather than eagerly at app launch).
 **Recommendation:** Profile S4 (navigation cycles) to see whether `applyDefaultAppearances` or appearance-related work is re-invoked on tab/scene changes, which would amplify this cost.
-**Status:** Observational — file only if S4 confirms re-invocation pattern.
+**Reproduction in S2:** Scene/Navigation setup symbols reproduce on main thread in S2 with reduced per-symbol weight (`SceneDelegate.scene` 4 ms in S2 vs 10 ms in S1 Run 3) because the 45 s window includes ~30 s of interactive workload that dilutes the cold-start setup signal in the Bytes Used aggregate. UIKit-side `_setupUpdateSeque...` weighs 210 ms in S2 Heaviest Stack Trace, confirming the underlying pattern is intact. Pattern persists across scenarios.
+**Status:** Observational — file only if S4 confirms re-invocation pattern on tab transitions.
 
 ---
 
@@ -162,13 +168,39 @@ These will be triaged into final report sections (§8 Memory, §9 ECn/Robustness
 - Threading Bitwarden hang count: 1 / 3 / 5 (mean 3, std dev 2, CV ≈ 67%)
 **Hypothesis:** Memory allocation is largely deterministic given the same app actions (same SDK init, same vault load), while threading and hang detection are sensitive to scheduler decisions, host system load, and simulator-level state pollution (see F-RT-08).
 **Recommendation:** When reporting threading findings, present them as ranges or qualitative patterns rather than as point estimates. For future audits where reproducibility is required, 5+ runs with simulator reset between each is the appropriate methodology, not 3.
-**Status:** Methodological note for the final report's Executive Summary.
+**Reproduction in S2:** Allocations CV in S2 across 3 runs: **1.93% on All Heap Persistent** (consistent with S1's 1.15%, both well under the 5% noise threshold). Threading was measured with only 1 run in S2 per the audit plan (rationale: F-RT-12 demonstrated in S1 that 3 threading runs do not add proportional information given the high CV; the cost-benefit of 3 runs is poor). The single S2 threading run is reported with the explicit caveat that exact hang counts and self-weights may vary ±50% on re-runs, but the structural patterns (which symbols appear on main, relative ranking by Bytes Used / Weight, presence of mutex/wait calls) are stable. Memory measurements remain the most stable signal in the audit.
+**Status:** Methodological note for the final report's Executive Summary. Validated across both S1 (3 threading runs) and S2 (1 threading run).
+
+---
+
+## F-RT-13: Rust SDK synchronous mutex acquisition and rayon worker wait on main thread (S2)
+
+**Severity:** Moderate — direct contributor to main-thread stalls during interactive scenarios
+**Source:** Time Profiler S2 (Bitwarden PID 29462, 1.04 s aggregate weight, Call Tree inverted with Hide System Libraries)
+**Evidence:**
+- `std::sys::pal::unix::sync::mutex::Mutex::lock` (BitwardenSdk_PackageProduct): **11.00 ms self-weight** on main thread during the 45.577 s S2 run.
+- `rayon_core::registry::WorkerThread::wait_until_cold` (BitwardenSdk_PackageProduct): **4.00 ms self-weight** on main thread during the same window.
+- Thread State Trace shows `Runnable` state with max duration 7.87 s — threads ready to run but waiting on the scheduler, consistent with rayon worker starvation pattern.
+- Thread State Trace shows `Blocked` state dominating (10,162 transitions, 3,719 s cumulative across all threads) — most threads spend most time waiting on synchronization primitives.
+- Time Profiler additionally surfaces `core::ops::function::FnOnce::call_once` (BitwardenSdk, 2 ms self) on main, indicating Rust closure invocation directly on the UI thread.
+
+**Hypothesis:** The Swift-side calling code is making blocking calls into the Rust SDK that synchronously acquire mutexes inside Rust (`std::sync::Mutex::lock`) and/or wait for rayon thread-pool workers to become available. When these calls originate from the main thread, they propagate scheduling latency back into the UI event loop, contributing to the 8 hangs observed in S2 (max duration 1.68 s, see F-RT-08).
+
+**Distinction from F-RT-09:** F-RT-09 documents *leaks* of `Arc<T>` allocations at the UniFFI Swift↔Rust async boundary. F-RT-13 documents *synchronous* mutex acquisition and worker-wait patterns on the main thread — these are not leaks but synchronization-induced stalls. Both findings point to the same architectural surface (UniFFI bindings between Swift and Rust SDK) but at different layers: F-RT-09 is the async/future lifecycle; F-RT-13 is the sync/locking subsystem underneath it. The combined pattern (sync locking on main thread + async futures leaking Arcs) suggests the Swift↔Rust boundary needs an architectural review covering both call patterns and lifecycle management.
+
+**Recommendation:** Audit Swift-side SDK call sites to confirm none of the methods backing search filtering, vault decryption, or cipher detail rendering are invoked synchronously from main. The rayon thread pool eager-initialization (22.5 MB stack VM observed in S1 M-iv) is justified if the pool is actually doing parallel work — but main-thread `wait_until_cold` suggests the pool is sometimes idle while main waits, indicating misalignment between Swift's call pattern and Rust's expected concurrency model.
+
+**Status:** New in S2. Verification: confirm in S3 (item edit → save flow) whether the mutex/wait pattern recurs during save-path SDK calls. If yes, file upstream with combined evidence from S2 and S3 plus F-RT-09's leak evidence as a joint architectural finding on the Swift↔Rust boundary.
+
+**Category:** Threading + Architecture (Swift↔Rust boundary).
 
 ---
 
 ## Cross-cutting observations
 
-These seven findings, taken together, paint a consistent picture: Bitwarden iOS is well-architected for its intended production deployment but is brittle when the environment deviates from that deployment. The brittleness concentrates in four places:
+These thirteen findings (seven from initial setup, six from S1+S2 profiling), taken together, paint a consistent picture: Bitwarden iOS is well-architected for its intended production deployment but is brittle when the environment deviates from that deployment, and has measurable steady-state performance overhead at the Swift↔Rust SDK boundary.
+
+The brittleness concentrates in four places:
 
 1. The persistence layer's reliance on App Groups (F-RT-01, F-RT-02)
 2. The keychain layer's reliance on Keychain Sharing entitlements (F-RT-07)
@@ -177,4 +209,12 @@ These seven findings, taken together, paint a consistent picture: Bitwarden iOS 
 
 Resource loading hygiene (F-RT-03) is a smaller separate concern.
 
-A modest set of upstream changes (graceful fallbacks for App Group and Keychain access group lookups, runtime-validated Crashlytics initialization, classified error handling, and an unconditional first-sync after empty-store login) would substantially improve the codebase's accessibility to external contributors and security researchers, and would also improve the first-install experience for production users, all without affecting the steady-state production behavior.
+The steady-state performance overhead concentrates in two places, both surfaced by S1 and reproduced/intensified by S2:
+
+5. The Swift↔Rust SDK boundary via UniFFI: F-RT-09 (Arc leaks on async futures, ~17 per run) and F-RT-13 (sync mutex acquisition + rayon worker wait on main thread, ~15 ms self-weight in S2). The combination is consistent: every leak is a future that did not get properly torn down, and every mutex wait on main is a synchronous call that should have been async. Both indicate the Swift call sites are not honoring the Rust SDK's intended async contract.
+
+6. SwiftUI render-graph over-evaluation: F-RT-10 (PositionObservingView body re-evaluated 93-142 times/sec across cold-start and scroll scenarios, independent of whether the user is actively scrolling). This is amplified by the existing tab-bar overdrawing pattern (S1/S2 Overdrawing analysis) where the GPU also pays per-frame compositing cost.
+
+The methodological findings (F-RT-08 progressive hang degradation, F-RT-12 high CV on threading metrics) shape how all other findings are interpreted: memory numbers are point estimates with ±2% confidence, threading numbers are qualitative patterns with ±50% confidence.
+
+A modest set of upstream changes (graceful fallbacks for App Group and Keychain access group lookups, runtime-validated Crashlytics initialization, classified error handling, an unconditional first-sync after empty-store login, audit of synchronous Swift-side SDK calls, and SwiftUI `Equatable` view boundaries around scroll-tracking views) would substantially improve the codebase's accessibility to external contributors and security researchers, would improve the first-install experience for production users, and would reduce sub-second hangs during interactive scenarios — all without affecting the steady-state production behavior.
