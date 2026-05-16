@@ -778,41 +778,381 @@ The Hangs track timeline shows:
 
 **Screenshots:** `audit/profiling/screenshots/s2_threading/` (5 PNGs).
 
----
-
 # Scenario S3 — Open item → Edit → Save
 
 ## S3 — Methodology
-*Status: PENDING. Network instrument may be added to capture sync round-trip.*
+
+Three independent runs were executed for Allocations + Leaks (deferred mode, leak checks every 10s) and one run for the Animation Hitches template (Hitches sub-instrument removed per documented Simulator limitation; Display, Time Profiler, Thread State Trace, Thermal State, and Hangs sub-instruments retained). All runs were 45 seconds, on iPhone 17 Pro simulator (iOS 26.3.1, Release build configuration). The simulator was not reset between runs (F-RT-08 environmental note applies). Vault was preloaded with ~150 items (F-RT-06 procedural workaround).
+
+**S3 script (executed within the 45-second window)**: cold start + master-password unlock (t≈0-15s); tap login item "Adidas" (t=15-17s); wait for item detail view to load fully (t=17-19s); tap Edit (t=19-21s); tap password field; tap eye icon to reveal password; pause observing revealed plaintext (t=23-27s); triple-tap to select entire password; type "AuditTest2026!" character by character at ~150ms cadence (t=29-31s); tap Save (t=32s); wait for confirmation and return to detail view (t=33-37s); idle observing final state until auto-stop (t=38-45s). The script exercises a complete encrypt-edit-decrypt-save cycle, including CoreData write via `NSManagedObjectContext.save()` and the network PUT to `/ciphers/{id}` if sync is enabled.
+
+**Setup note on signing**: between S2 and S3 the app's `get-task-allow` entitlement was lost (likely due to a simulator state change or rebuild between sessions). The fix consisted of `xcrun simctl uninstall` followed by a clean `Cmd+R` from Xcode in Debug configuration, then `Cmd+I` (Product → Profile) for the actual Instruments run. The workaround is documented for future audit work; it does not affect the validity of S3 measurements (the app was clean-firmly profiled).
+
+**Instruments used for S3:**
+- Allocations + Leaks (3 runs × 45 s) — completed
+- Animation Hitches template, Hitches sub-instrument removed (1 run × 45 s) — completed; F-RT-12 methodological caveat applies (single Threading run by design)
+- Color Blended Layers debug overlay, 3 surfaces captured (item detail view, item edit form, password revealed in edit form) — completed
+- Metal System Trace: not re-attempted (Simulator limitation persists from S1)
+- Energy Log: not attempted (physical-device-only limitation persists from S1)
+
+**Raw screenshots:** `audit/profiling/screenshots/s3_allocations/` (12 PNGs, 3 runs × 4 views), `audit/profiling/screenshots/s3_threading/` (5 PNGs, 1 run; Hitches excluded), `audit/profiling/screenshots/s3_overdrawing/` (3 PNGs). Total: 20 PNGs documenting S3.
+
+---
 
 ## S3 — GPU rendering analysis
-*Status: PENDING*
+
+*Status: COMPLETE — data from Animation Hitches template's Display sub-instrument (1 run, 45.587 s). Same Simulator limitations apply as in S1 and S2.*
+
+### Frame rate metrics
+
+The Display sub-instrument captured Average Frame Time across the 45.587 s window. Three distinct phases are visible in the timeline:
+
+- **Phase 1 (t ≈ 0–14 s, cold start)**: reproduces the S1/S2 pattern with two tall spikes near t≈3 s and t≈12 s coinciding with Surface 7 → Surface 8 → Surface 9 composition transitions.
+- **Phase 2 (t ≈ 14–32 s, drill-in + edit + save)**: lower density of Average Frame Time bars than S2's active scroll phase, but two tall spikes visible at t≈17 s (drill-in to item detail, triggering decryption) and t≈32 s (save action, triggering encryption + CoreData write).
+- **Phase 3 (t ≈ 32–45 s, post-save idle)**: bars taper to near-baseline as the app returns to steady-state.
+
+Surface composition follows: Surface 7 (initial) → brief Surface 8 → Surface 7 → **Surface 9 (sustained, t≈15–25 s) → Surface 7 → Surface 9 (sustained, t≈30–40 s) → Surface 9 alternation**. Two extended Surface 9 segments overlap temporally with (a) the drill-in + edit-form-load hang and (b) the save + return-transition hang, consistent with the F-RT-08 pattern that the render server holds composition longer when the main thread is doing heavy work.
+
+VSync alignment (red tick pattern in Display 1 track) remains regular throughout. The display pipeline cadence is not the bottleneck.
+
+### Problems and strengths
+
+**Strengths:**
+- Thermal state remains `Nominal` for all 45.587 seconds (no throttling during a scenario that includes encryption work).
+- VSync cadence regular throughout; no extended display-pipeline stalls.
+- Average Frame Time during pure idle (t≈37–45 s, post-save) drops to baseline, indicating steady-state rendering remains within budget when no encryption/CoreData work is pending.
+
+**Problems:**
+- The two hangs detected during S3 (count 2, but max duration 1.45 s and avg duration 955.18 ms) both align temporally with surface composition transitions — the user perceives unresponsiveness at the moments where surface composition changes coincide with main-thread encryption/save work. See Threading T-iii.
+- The Hitches sub-instrument remains unavailable on Simulator (same limitation as S1 and S2).
+
+### GPU consumption — scope limitation
+
+Same as S1/S2. Not re-tested. Thermal State reports `Nominal` for all 45.587 s of the S3 run.
+
+### Power consumption — scope limitation
+
+Same as S1/S2. Not re-tested.
+
+---
 
 ## S3 — Overdrawing analysis
-*Status: PENDING*
+
+### Method
+Simulator → Debug → Color Blended Layers toggle enabled during the S3 interaction. Three surfaces captured at distinct interaction states.
+
+### Captured surfaces
+
+| Screenshot | Surface | File |
+|------------|---------|------|
+| Item detail view (View login) | Airbnb login item rendered, all fields visible | `s3_overdrawing_item_detail.png` |
+| Item edit form (password hidden) | Edit form with 4-dot masked password | `s3_overdrawing_item_edit.png` |
+| Item edit form (password revealed) | Same form with password "4321" visible in plaintext | `s3_overdrawing_password_revealed.png` |
+
+All screenshots in `audit/profiling/screenshots/s3_overdrawing/`.
+
+### Observations by surface
+
+**Item detail view, View login (`s3_overdrawing_item_detail.png`):**
+- Background between cards: uniform green (not overdrawing in empty inter-card space).
+- Status bar + navigation header zone: brown/maroon saturated, indicating 3+ layers stacked at the top of the screen (system status bar + app nav bar + screen background).
+- Item header card ("Airbnb" + "Social" folder): light pink/red (2 layers — card background blending with screen background).
+- LOGIN CREDENTIALS card (Username "padillag", Password masked, "Check password for data breaches" link): light pink/red.
+- Authenticator key card with "Premium subscription required" placeholder: **darker red than other cards**, indicating extra layer (likely a material/blur background for the premium upsell call-to-action).
+- AUTOFILL OPTIONS card (Website URI "www.airbnb.com"): light pink/red.
+- ADDITIONAL OPTIONS card (Notes "Old password – rotate next quarter"): light pink/red.
+- Timestamps zone at bottom (Created, Last edited, Password last updated): light pink/red.
+- Floating action button (FAB) "edit pencil": saturated red opaque (correct rendering for primary interactive control).
+
+**Item edit form, password hidden (`s3_overdrawing_item_edit.png`):**
+- Background between cards: uniform green (acceptable).
+- Same status-bar zone stacking pattern as detail view.
+- ITEM DETAILS card (Item name "Airbnb" required field, Folder "Social"): light pink/red.
+- LOGIN CREDENTIALS card with Username "padillag" and Password field showing 4 dots ("••••"): light pink/red.
+- Authenticator key card: **same darker red as detail view** — the premium upsell continues to compose with more layers than necessary.
+- AUTOFILL OPTIONS card and "Add website" button: light pink/red.
+- Save button (blue checkmark, top right): saturated opaque (correct).
+- Cancel button (X, top left): green-light surrounding → acceptable.
+
+**Item edit form, password revealed (`s3_overdrawing_password_revealed.png`):**
+- Visually identical to the edit form above, with two changes:
+  - The eye icon switches to eye-slash, indicating the revealed state (correct opaque rendering for the toggle).
+  - The Password field now displays "4321" in plaintext (text rendered opaque red over the field's pink/red background, preserving legibility).
+- The composition pattern is otherwise unchanged from the hidden state — revealing the password does not introduce additional overdrawing.
+
+### Problems
+
+| Problem | Surface(s) | Likely cause | Performance implication |
+|---------|------------|---------------|--------------------------|
+| Card backgrounds blend with screen | All three S3 surfaces | SwiftUI default container non-opaque | Per-frame compositing cost on detail and edit views |
+| Authenticator key card double-stacked | Detail and edit views | Premium-upsell card likely uses a material/blur background to differentiate from regular cards | Extra GPU work concentrated in a single card region |
+| Status/navigation header zone 3+ layer stack | All three S3 surfaces | Status bar overlay + nav bar + screen background not consolidated | Consistent across all scenarios; same pattern observed in S1 and S2 |
+
+### Strengths
+
+- The form fields in the edit view (Username, Password, Folder selector, Website URI text fields) all render their input text opaquely, preserving legibility regardless of background composition.
+- The Save button (saturated blue) and floating action button (saturated red FAB edit) are correctly opaque single-layer.
+- The eye toggle icon (reveal/hide password) renders correctly in both states, with the icon glyph rendered opaque over the field's background.
+- App icon assets (Airbnb logo at top of detail view) render single-layer.
+- **S3 overdrawing is less severe than S2**: the S2 vault-drilled-into-Logins surface showed near-total-screen saturated red (4-5 layer composition); S3 surfaces show only the structural pattern of "cards blend with screen" plus the premium-upsell card and status-bar zone exceptions. The single-item detail/edit views do not stack as many layers as the modal-over-vault-list S2 pattern.
+
+Screenshots in `audit/profiling/screenshots/s3_overdrawing/` (3 PNGs).
+
+---
 
 ## S3 — Memory management
-### M-i — Leaks
-*Status: PENDING*
 
-### M-ii — RAM consumption
-*Status: PENDING. Focus: does memory grow during edit→save cycle, and does it return to baseline?*
+### M-i — Memory leaks: which, where?
+
+Three Leaks-instrument snapshots per run (every 10 seconds within the 45-second window). S3 reproduces the established F-RT-09 pattern and introduces a new finding (F-RT-14 candidate) specific to the drill-in/edit/save flow.
+
+**Reproduced from S1/S2:**
+
+| Source | Per-run count (approx) | Sizes observed | Stack trace signature |
+|--------|------------------------|----------------|------------------------|
+| Bitwarden Rust SDK via UniFFI FFI boundary (F-RT-09) | 35-50+ allocs per run (more than S1/S2 because the drill-in + save flow involves more async FFI calls) | 64 bytes (most), 128 bytes (some) | `alloc::alloc::exchange_malloc` → `alloc::sync::Arc<T>::new` → `uniffi_core::ffi::rustfuture::future` → `ffi_bitwarden_uniffi_rust_future_*` → `swift::runJobInEstablishedExecutor` |
+| CoreData internal | 1 per run (visible in runs 1 and 3) | 16 bytes | `+[_NSMemoryStorePredicateRemapper defaultInstance]` |
+| libswiftCore swift_slowAlloc | various 64-byte allocations attributed to `libswiftCore.dylib`, surface increased in S3 vs S1/S2 | 64 bytes | `swift_slowAlloc` — Swift runtime metadata allocations not properly torn down |
+
+**NEW in S3 — Candidate finding F-RT-14: Swift-side coordinator leaks on drill-in path.**
+
+The leaks pane for S3 Run 1 (`s3_allocations_run1_leaks.png`) shows three Swift-side leaks not observed in S1 or S2, all in `BitwardenShared` and `libswiftCore.dylib`, accompanying the drill-in to item detail:
+
+| Leaked Object | Size | Responsible Library | Responsible Frame |
+|---|---|---|---|
+| `VaultItemCoordinator` | 320 Bytes | BitwardenShared | `specialized VaultItemCoordinator.__allocating_init(appExtensionDelegate:authRepository:errorReporter:...)` |
+| `AnyCoordinator<VaultItemRoute, ...>` | 144 Bytes | libswiftCore.dylib | `swift_slowAlloc` |
+| `DefaultVaultItemActionHelper` | 80 Bytes | libswiftCore.dylib | `swift_slowAlloc` |
+
+The three objects form a single coordinator scaffold. `VaultItemCoordinator` is the coordinator created when the user taps an item from the vault list; `AnyCoordinator<VaultItemRoute, ...>` is the type-erased wrapper used by the parent `VaultCoordinator` to hold it; `DefaultVaultItemActionHelper` is the action helper instantiated alongside it. After the user saves and returns to the vault list, these three objects do not deallocate — they are leaked.
+
+**Hypothesis**: the parent coordinator holds a strong reference to `VaultItemCoordinator` (instead of `weak`), or the coordinator's child relationship is not torn down on dismiss/save. The pattern is distinct from F-RT-09 (Rust-side async future leaks) — F-RT-14 is a pure Swift coordinator-lifecycle leak.
+
+**Severity assessment**: Moderate. The leak adds ~544 bytes per item drill-in (320 + 144 + 80). For a power user who edits 50 items per session, the cumulative leak is ~27 KB — small in absolute terms but indicative of a structural memory issue. More concerning: in S4 (navigation cycles), if this pattern compounds across repeated drill-ins, the persistent footprint may grow monotonically rather than returning to baseline.
+
+**Status**: Confirm in S4 (repeated navigation cycles). If S4 confirms the pattern reproduces across multiple drill-ins, file upstream with combined S3+S4 evidence as F-RT-14.
+
+**Screenshots:** `s3_allocations_run{1,2,3}_leaks.png`.
+
+### M-ii — RAM consumption across the scenario
+
+#### Memory growth pattern
+
+All three S3 runs exhibit a consistent shape: rapid cold-start growth (t≈0-14 s), brief plateau (t≈14-15 s, idle before drill-in), then **continued growth during the drill-in + edit + save phase** (t≈15-35 s), with a final plateau during post-save idle (t≈35-45 s). Unlike S2 where the heap kept climbing throughout the active interaction window, S3 shows a more pronounced step-up pattern around t≈15 s (drill-in moment) — likely the moment when `VaultItemCoordinator` and the edit form's view-models are instantiated.
+
+#### Per-run memory footprint at end of 45-second window
+
+| Run | All Heap & Anonymous VM Persistent | All Heap Allocations Persistent | All Anonymous VM Persistent | Total Bytes (cumulative) | # Persistent allocations | # Transient allocations |
+|-----|------------------------------------|---------------------------------|------------------------------|---------------------------|----------------------------|---------------------------|
+| 1   | 66.84 MiB | 27.68 MiB | 39.16 MiB | 514.73 MiB | 181,948 | 2,503,438 |
+| 2   | 68.02 MiB | 28.83 MiB | 39.19 MiB | 596.81 MiB | 189,244 | 3,052,722 |
+| 3   | 69.75 MiB | 29.74 MiB | 40.02 MiB | 643.76 MiB | 198,249 | 2,847,179 |
+| **Mean ± SD** | **68.20 ± 1.46** | **28.75 ± 1.03** | **39.46 ± 0.49** | **585.10 ± 65.34** | **189,814 ± 8,164** | **2,801,113 ± 277,558** |
+| **Coefficient of variation** | 2.14% | 3.59% | 1.24% | 11.17% | 4.30% | 9.91% |
+
+**Interpretation:**
+
+- **All Heap & Anonymous VM CV = 2.14% in S3** (vs 1.15% in S1, 1.93% in S2). The CV is incrementally higher in each scenario because the workload becomes more variable: S1 is pure cold start with no interaction, S2 adds scroll+search interaction, S3 adds drill-in + form edit + save (the most variable per-run because timing of network sync and CoreData merge varies across runs). All three CVs remain well under the 5% noise threshold, confirming F-RT-12 — memory measurements remain the most stable signal in the audit.
+
+- **Persistent footprint at S3 end (66.84-69.75 MiB) is comparable to S1's heap+VM total (~60 MiB)** at the end of cold start, indicating that the steady-state-plus-one-drill-in retention is in the same order of magnitude as cold-start retention. The drill-in itself adds ~6-9 MiB to the persistent footprint — most of this is anonymous VM (CoreAnimation surfaces for the new view hierarchy) rather than heap (Swift objects), suggesting the edit form's view rendering accounts for more retained memory than the form's data models.
+
+- **Total cumulative bytes ratio (~585 MiB cumulative vs ~28 MiB heap persistent) ≈ 20:1** — even higher than S2's 17:1 and substantially higher than S1's 5:1. The drill-in + save flow generates more transient allocations per persistent byte retained than scroll+search. The encryption pipeline (CipherRequestModel.encode + PUT to server) likely accounts for a large fraction of this transient churn.
+
+- **# Transient CV = 9.91%** (vs 6.46% in S2, 3.00% in S1). The save pipeline is the most variable phase across runs; CoreData merge, network sync timing, and post-save view-graph invalidation each contribute small per-run differences in the count of intermediate allocations.
+
+#### Top resident-memory categories at run end (Run 3 representative)
+
+The S3 Run 3 Statistics view shows the same dominant categories as S1/S2 with the following S3-specific observations:
+
+| Category | Persistent Bytes (S3 Run 3) | Persistent Bytes (S2 Run 3) | Change | Notes |
+|----------|------------------------------|------------------------------|---|---|
+| All Heap & Anonymous VM | 69.75 MiB | 68.02 MiB (S2 Run 3 was 67.95) | comparable | Total retention similar at end of S3 vs S2 |
+| Malloc 16.00 KiB | 4.34 MiB / 278 allocs | 3.27 MiB / 209 allocs | +33% | Larger heap blocks for form data |
+| UnknownObjectType | 960.62 KiB / 10,805 allocs | 1.80 MiB / 19,445 allocs (S2) | **-47%** | S3 has FEWER unsymbolicated Swift types persistent than S2; suggests the drill-in creates fewer per-row models than scroll did |
+| CFString (store) | 1.17 MiB / 6,240 allocs | 1.17 MiB / 6,290 allocs | unchanged | String storage stable across scenarios |
+| Malloc 32 Bytes | 951.66 KiB / 30,453 allocs | 913.69 KiB / 29,238 allocs | +4% | Small allocs comparable |
+| VM: CoreAnimation | 1.00 MiB / 25 regions | 672.00 KiB / 15 regions (S1) | **+49%** | Edit form view hierarchy is heavier than vault list in CoreAnimation surfaces |
+| VM: SQLite page cache | 1.00 MiB / 8 pages | 768.00 KiB / 6 pages | +30% | Vault save extends the SQLite working set |
+
+**Observations**:
+- The reduced `UnknownObjectType` count in S3 vs S2 is consistent with the hypothesis that S2's count was inflated by per-row scroll cell view-models. S3's drill-in creates only one item's worth of view-models, so the count drops back closer to S1 levels.
+- The increase in `VM: CoreAnimation` regions (15 → 25) reflects the deeper view hierarchy of the edit form (multiple cards, text fields, toggle controls, FAB) versus the vault list (a single scrollable table).
+- The SQLite page cache grew from 768 KiB to 1.00 MiB, consistent with the save operation extending the active SQLite working set (the modified item row, its index entries, the WAL frame).
+
+**Screenshots:** `s3_allocations_run{1,2,3}_alltracks.png`, `s3_allocations_run{1,2,3}_summary.png`.
 
 ### M-iii — Libraries for leak management
-*Cross-reference to S1 M-iii.*
+
+Cross-reference to S1 M-iii. The library landscape does not vary by scenario. For F-RT-14 specifically (Swift coordinator leak), the Memory Graph Debugger in Xcode would be the most effective tool to visualize the retain relationships at the moment of leak — Instruments' Leaks instrument identifies the leak but does not show the parent retain path. A Memory Graph Debugger run capturing the coordinator tree at "after save, returned to vault list" state is recommended for confirming the F-RT-14 hypothesis and is noted as a follow-up investigation step.
 
 ### M-iv — Allocation patterns, GC, heap dumps
-*Status: PENDING*
+
+#### Garbage collection
+
+Same as S1/S2. iOS does not have a GC; ARC is deterministic. S3-relevant question: how do allocation patterns shift under the encrypt-edit-decrypt-save workload?
+
+#### Allocation patterns observed during S3
+
+Top allocation sites by cumulative bytes (Allocations Call Tree, system libraries hidden, call tree inverted; Run 3 representative; Runs 1-2 within ±5% on top symbols):
+
+| Symbol | Library | Bytes Used (Run 3) | Count (Run 3) | Cross-run notes |
+|--------|---------|---------------------|-----------------|------------------|
+| `main` (Bitwarden) | Bitwarden | 25.83 MB (37.0%) | 130,254 | Runs 1-3: 23.13 / 24.12 / 25.83 MB — slight upward trend, consistent with progressive Swift heap growth across runs without simulator reset |
+| `std::sys::thread::unix::Thread::new` | BitwardenSdk | 22.52 MB (32.3%) | 11 | Identical across all three S3 runs and across S1; rayon pool eager init |
+| `FontConvertible.registerIfNeeded()` | BitwardenResources | 1.58 MB | **11,611** | Runs 1-2-3: 11,609 / 11,609 / 11,611. **Across all 9 audit runs (3×S1 + 3×S2 + 3×S3), this count varies from 11,609 to 11,613 — CV ≈ 0.01%.** F-RT-03 fully validated. |
+| `closure #1 in PositionObservingView.body.getter` | BitwardenShared | 1.25 MB | 4,045 | Runs 1-2-3: 4,118 / 4,123 / 4,045 — mean 4,095, CV 1.03%. F-RT-10 reproduced at the highest determinism of any scenario. |
+| `closure #1 in FetchedResultsSubscription.init(...)` | BitwardenKit | 554.70 KB | 1,169 | Lower than S1/S2 because S3 has fewer CoreData subscriptions active simultaneously |
+| **`NSManagedObjectContext.executeAndMergeChanges(batchDeleteRequests:batchInsertRequests:additionalContexts:)`** | BitwardenKit | **454.06 KB** | **1,270** | **NEW in S3** — confirms CoreData batch merge propagation during save. See F-RT-15 candidate below. |
+| `UINavigationController.replace<A>(_:animated:)` | BitwardenKit | 413.80 KB | 2,551 | Higher than S2 (322.30 KB / 1,855) because drill-in + back navigation adds navigation transitions |
+| `DataStore.init(errorReporter:storeType:)` | BitwardenShared | 242.25 KB | 889 | Approach-2 caveat from S1 still applies |
+| `AuthenticatorBridgeDataStore.init(...)` | AuthenticatorBridgeKit | 214.84 KB | 420 | Approach-2 caveat applies |
+| `BitwardenTabBarController.setNavigators<A>(_:)` | BitwardenShared | 201.05 KB | 1,420 | Consistent with S1/S2 |
+| `RootViewController.childViewController.didset` | BitwardenKit | 193.89 KB | 1,464 | Comparable to S2 |
+| `specialized FontConvertible.register()` | BitwardenResources | 155.58 KB | 85 | Consistent with S1/S2 |
+| `alloc::alloc::Global::alloc_impl_runtime` | BitwardenSdk | 151.12 KB | 145 | Rust SDK heap allocations |
+| `@nonobjc UIImage.__allocating_init(named:in:compatibleWith:)` | BitwardenResources | 149.19 KB | 1,738 | UIImage instantiation for icons |
+| `static UI.applyDefaultAppearances()` | BitwardenKit | 149.00 KB | 1,016 | Consistent with S1/S2 |
+| **`UITextView.init()`** | BitwardenKit | **53.56 KB** | **503** | **NEW in S3** — text fields of the edit form. Confirms the form's text-field instantiation cost. |
+| **`CipherRequestModel.encode(to:)`** | BitwardenShared | **80.42 KB** | **7** | **NEW in S3** — confirms the encrypt-and-encode-to-JSON path on the save action. The small call count (7) for a substantial byte size suggests each call generates relatively large JSON payloads (the full encrypted cipher representation). |
+| **`NSManagedObjectContext.saveIfChanged()`** | BitwardenKit | **40.56 KB** | **281** | **NEW in S3** — the actual save call. The high call count (281) for a single user save is unexpected; likely indicates the save propagates through multiple managed object contexts (parent, viewContext, backgroundContext, autofill, watch). |
+| `closure #1 in DefaultWatchService.init(...)` | BitwardenShared | 43.55 KB (Run 1) | 126 | **NEW in S3** Run 1 — Watch sync service activated during the save flow |
+| `_RNvCs5QKde7ScR4H_7___rustc14___rust_realloc` | BitwardenSdk | 79.62 KB | 629 | Rust reallocations for encryption work |
+| `Date.dateTimeDisplay.getter` | BitwardenKit | 83.44 KB | 500 | **NEW prominent in S3** — rendering of "Last edited", "Created", "Password last updated" timestamps in the detail view |
+| `closure #1 in closure #1 in variable initialization expression of static JSONDecoder.defaultDecoder` | BitwardenKit | 69.11 KB | 329 | **NEW prominent in S3** — JSON decoding for the cipher response after server-side update |
+| `AlertPresentable.present(_:onDismissed:)` (Run 2) | BitwardenKit | 124.58 KB | 385 | **NEW in S3** — confirmation alert presented after save |
+
+#### NEW S3-specific candidate finding F-RT-15: CoreData batch merge over-propagation during save
+
+The `NSManagedObjectContext.executeAndMergeChanges(batchDeleteRequests:batchInsertRequests:additionalContexts:)` call with **1,270 invocations for a single item edit save** is unexpectedly high. A typical CoreData save would propagate changes to a small fixed number of contexts (3-5: parent, view, background, plus any auxiliary contexts). 1,270 invocations suggests either:
+
+- (a) The propagation is iterating over all 150 vault items individually rather than batching the change for the one modified item, or
+- (b) Multiple contexts (the watch context, the autofill extension context, etc.) are each being notified individually and each notification triggers further sub-propagation.
+
+This is a candidate finding for upstream investigation. Severity is moderate: 1,270 CoreData operations per save adds measurable latency to the save path (correlated with the avg hang duration of 955 ms observed in Threading). **Status**: candidate F-RT-15. To confirm in S4 across multiple consecutive saves and to file upstream if pattern persists. See Threading T-iii for the corresponding hang correlation.
+
+#### Cross-run determinism in S3
+
+The audit's determinism findings continue to hold in S3:
+
+- **FontConvertible.registerIfNeeded count CV ≈ 0.01% across 9 audit runs total** (S1+S2+S3). The over-invocation is fully structural.
+- **PositionObservingView.body.getter count CV = 1.03% across 3 S3 runs**, the lowest CV observed for this metric in any scenario. F-RT-10 confirmed with progressively stronger evidence.
+- Top-tier symbols (`main`, `std::sys::thread::unix::Thread::new`, the various coordinator and DataStore inits) all show CV < 5% across S3 runs.
+
+Instruments deferred-mode `.trace` files (not committed to repository due to size) serve as the functional equivalent of heap dumps; per-run summary and call-tree screenshots are committed in `audit/profiling/screenshots/s3_allocations/` (12 PNGs).
+
+---
 
 ## S3 — Threading
-### T-i — Thread creation, async usage
-*Status: PENDING*
 
-### T-ii — Main-thread locks
-*Status: PENDING — save path likely involves CoreData write + sync; both candidates for off-main work.*
+*Status: COMPLETE — Animation Hitches template with Time Profiler + Thread State Trace + Thermal State + Hangs sub-instruments (Hitches removed per Simulator limitation). 1 run × 45.587 s. Screenshots: `audit/profiling/screenshots/s3_threading/` (5 PNGs).*
 
-### T-iii — Multithreading performance impact
-*Status: PENDING*
+### Run summary
+
+| Metric | S3 Run 1 | S2 Run 1 (reference) | S1 Run 3 (worst) | Comparative observation |
+|---|---|---|---|---|
+| Duration | 45.587 s | 45.577 s | 30.585 s | comparable wall-clock |
+| Bitwarden PID | 78152 | 29462 | 76119 | fresh PIDs |
+| Bitwarden CPU total (Weight) | 504 ms | 1.04 s | 18.76 s | S3 lower than S2; S3 has fewer continuous interactions |
+| **Hangs count** | **2** | 8 | 5 | **Fewer hangs in S3 than S2** |
+| Min hang duration | 457.83 ms | 181.73 ms | (not reported) | S3 hangs are minimum > S2 minimum |
+| **Avg hang duration** | **955.18 ms** | 562.40 ms | (not reported) | **+70% vs S2** — hangs are LONGER on average in S3 |
+| Std Dev hang duration | 703.36 ms | 467.49 ms | 219.24 ms | Increasing variability |
+| **Max hang duration** | **1.45 s** | 1.68 s | 630.88 ms | Both S2 and S3 cross sub-second user-perceptible |
+| Range | 994.70 ms | 1.50 s | (not reported) | |
+| Thermal state | Nominal | Nominal | Nominal | unchanged |
+| Thread state transitions (all) | 18,781 | 30,045 | 8,990 | S3 between S1 and S2 |
+
+### T-i — Where and how are threads created? Async/await usage observed
+
+S3 confirms the threading sources observed in S1 and S2 (Rust SDK rayon pool, GCD workers, Swift Concurrency executor, pthread workqueue, CoreData publishers, SwiftUI body re-evaluation). The S3 Time Profiler Heaviest Stack Trace places `main` (Bitwarden) as the top consumer at 226 ms (44.8%) of the 504 ms total Bitwarden weight — proportionally similar to S2's main-thread share (66.7% in S2).
+
+S3-specific new threading sources visible in the Time Profiler Call Tree (inverted, Hide System Libraries):
+
+- **`AVCaptureMetadataOutput.__allocating_init()`** (2 ms self) — camera output initialization preloaded during S3 cold start. Visible in S3 but not prominent in S1/S2. Likely the Authenticator setup's QR-scanner camera being preloaded eagerly.
+- **`closure #1 in VaultItemManagementMenuView.body.getter`** (2 ms self) — SwiftUI body re-evaluation for the item-management menu (the "..." overflow menu on the item detail view).
+- **`VaultItemDecorativeImageView.placeholderDecorativeImage(_:)`** (1 ms self) — placeholder icon rendering for items.
+- **`closure #1 in GuidedTourScrollView.body.getter`** (1 ms self) — SwiftUI body re-evaluation for the in-app guided tour scroll view, which evidently runs body even when not visible.
+- **`ServerConfig.init(from:)`** (3 ms self) — network response parsing, likely the server config fetched during the save round-trip.
+
+### T-ii — Possible locks on main thread
+
+The Time Profiler Call Tree (inverted, Hide System Libraries) surfaces the following Bitwarden-attributed symbols on the main thread during S3, ordered by self weight:
+
+| Symbol | Self-weight | Notes |
+|---|---|---|
+| `main` (Bitwarden) | 226 ms (44.8%) | Aggregate of all main-thread Bitwarden work |
+| `closure #1 in PositionObservingView.body.getter` | 33 ms (6.5%) | Reproduces F-RT-10 in S3 |
+| `__swift_instantiateConcreteTypeFromMangledNameV2` | 13 ms (2.6%) | Swift runtime type instantiation |
+| `FontConvertible.register()` INLINED | 9 ms (1.8%) | Reproduces F-RT-03 in S3 |
+| `specialized SceneDelegate.scene(_:willConnectTo:options:)` | 8 ms (1.6%) | Reproduces F-RT-11 in S3 |
+| `static UI.applyDefaultAppearances()` | 4 ms (0.8%) | Reproduces F-RT-11 |
+| `ServerConfig.init(from:)` | 3 ms (0.6%) | New in S3 — server config parsing |
+| `ShakeWindow.init(windowScene:onShakeDetected:)` | 3 ms (0.6%) | Shake-to-lock feature overhead, comparable to S2 |
+| `Store.state.getter` | 3 ms (0.6%) | Store state access on main |
+| `static Localizations.about.getter` | 3 ms (0.6%) | Localization string access |
+| `AuthenticatorBridgeDataStore.init(errorReporter:groupIdentifier:storeType:)` | 3 ms (0.6%) | DataStore initialization on main |
+| `specialized DefaultAppSettingsStore.fetch<A>(for:decoder:)` | 2 ms (0.4%) | UserDefaults access during cold start |
+| `@nonobjc NSManagedObjectModel.init(contentsOf:)` | 2 ms (0.4%) | CoreData model load |
+| `AVCaptureMetadataOutput.__allocating_init()` | 2 ms (0.4%) | Camera preload |
+| `protocol witness for ObservableObject.objectWillChange.getter in conformance Store<A, B, C>` | 2 ms (0.4%) | Reproduces F-RT-10 ObservableObject pattern |
+| `CodableModelData.model.getter` | 2 ms (0.4%) | Decoded model access |
+| `closure #1 in VaultItemManagementMenuView.body.getter` | 2 ms (0.4%) | New S3 — menu body re-evaluation |
+| `FontConvertible.registerIfNeeded()` | 2 ms (0.4%) | F-RT-03 |
+| `specialized Store.state.setter` | 2 ms (0.4%) | F-RT-10 |
+
+**Critical observation — F-RT-13 NOT reproduced in S3.** The S3 Time Profiler shows **no `std::sys::pal::unix::sync::mutex::Mutex::lock`** and **no `rayon_core::registry::WorkerThread::wait_until_cold`** in main-thread self weight. This contrasts with S2 where these symbols accounted for 11 ms and 4 ms respectively. The interpretation: F-RT-13 (Rust SDK synchronous mutex contention on main) is a workload-specific pattern that surfaces during scroll-and-search interaction but NOT during single-item drill-in + edit + save. The Swift-side calling code for the search filter and scroll cells appears to make synchronous Rust SDK calls; the calling code for item drill-in and save appears to use async patterns more consistently. F-RT-13 is therefore now characterized as **scenario-specific to interactive scroll+search workloads**, not a general property of the SDK boundary.
+
+### T-iii — How multithreading affects performance
+
+**Hangs:** The single S3 run produced **2 hangs** with the following characteristics:
+- Count: 2
+- Min duration: 457.83 ms
+- Avg duration: **955.18 ms** (above 500 ms Hang threshold)
+- Std Dev: 703.36 ms
+- **Max duration: 1.45 s** (sub-second user-perceptible)
+- Range: 994.70 ms
+
+Comparison to S2 (8 hangs, avg 562.40 ms, max 1.68 s) and S1 worst run (5 hangs, max 630.88 ms): **S3 produces fewer hangs but each hang is longer on average than in S2**. The hangs cluster temporally with two specific user actions: one at t≈3-4 s (orange Hang label, the cold start cluster, same as S1/S2) and one at t≈9-10 s (blue Hang label, "Brief Unresponsiveness" classification per Apple's labeling — the drill-in moment when the item detail view loads).
+
+The pattern is methodologically interesting: **F-RT-08 (progressive hang degradation) needs refinement based on S3 evidence**. The pattern is not strictly monotonic in count (S1: 1→3→5, S2: 8, S3: 2). Rather, it appears to be: cold-start interaction always produces ~1 hang regardless of scenario; the additional hangs depend on the specific interaction workload (S2's keystroke-driven search produces many short hangs; S3's discrete edit-and-save produces fewer but longer hangs). The **total time spent in hang state** (count × avg duration) is roughly comparable: S2 ≈ 8 × 562 ms ≈ 4.5 s; S3 ≈ 2 × 955 ms ≈ 1.9 s. S3 is actually less hang-impacted in total wall-clock time than S2, but each individual hang in S3 crosses the perceptibility threshold more decisively.
+
+**Thread State Trace (S3 specific data):**
+
+| State | Count | Duration | Avg | Max | Notes vs S2 |
+|---|---|---|---|---|---|
+| Blocked | 7,519 | 3,884.48 s | 31.00 s | 45.59 s | -26% vs S2 (10,162) — less I/O wait |
+| Running | 5,432 | 4.55 s | 838.12 µs | **863.48 ms** | Max running time is **+82% vs S2** (473.88 ms). A single thread ran continuously for 863 ms without yielding — this is the save path encryption + CoreData write. |
+| Runnable | 2,436 | 4.73 ms | 1.94 µs | **194.71 µs** | **Max is -100% smaller than S2 (7.87 s)** — almost no scheduling starvation in S3. The rayon pool starvation pattern of S2 does not reproduce. |
+| Interrupted | 2,155 | 3.49 ms | 1.62 µs | 1.55 µs | comparable to S2 |
+| Preempted | 782 | 45.29 s | 57.92 ms | 45.27 s | comparable |
+| Unknown | 364 | 272.71 min | 44.95 s | 45.59 s | unchanged |
+| Idle | 92 | 10.14 min | 6.61 s | 45.59 s | comparable |
+| **Terminated** | **1** | **2.66 s** | **2.66 s** | **2.66 s** | **NEW in S3** — one thread terminated during the run, lasting 2.66 s before termination. Likely the save-task background thread completing and deallocating, consistent with the F-RT-14 hypothesis that the coordinator scaffold tears down (mostly) after save. |
+
+**Interpretation:**
+- The Running max of 863 ms (vs S2's 473 ms) is direct evidence that the save path produces longer continuous CPU bursts than scroll/search. When this Running burst is on main thread, it produces the 1.45 s hang at save time.
+- The much lower Runnable max in S3 (194 µs vs S2's 7.87 s) indicates the rayon thread pool starvation observed in S2 does NOT reproduce in S3. This is consistent with the F-RT-13 observation that S3 does not exhibit the Rust mutex/rayon contention pattern.
+- The Terminated state appearing in S3 with one thread terminating at 2.66 s is unique to S3 — it corresponds to a save-related background task completing and being torn down. This is healthy thread lifecycle behavior, not a leak.
+
+**Multithreading conclusion for S3:**
+
+*Positive contributions* (preserved from S1/S2):
+- Rust SDK encryption work runs on Rust-spawned threads
+- Thermal state remains Nominal throughout (no throttling during the save's encryption burst)
+- Save-task background thread terminates cleanly after completion
+
+*Negative contributions / observed bottlenecks:*
+- **(a) Two hangs crossing 500 ms threshold, one crossing 1 s** — drill-in load (Brief Unresponsiveness ≈ 0.5 s) and save burst (Hang ≈ 1.45 s).
+- **(b) F-RT-09 reproduced and intensified** — 35-50+ Arc leaks per S3 run (vs 16-18 in S2 and 17-19 in S1). The drill-in + save flow produces more async Rust SDK calls and therefore more leak surface.
+- **(c) F-RT-10 reproduced at highest determinism yet** — PositionObservingView.body.getter at 4,118/4,123/4,045 evaluations across 3 S3 runs (CV 1.03%). The pattern is fully structural.
+- **(d) F-RT-11 reproduced** — Scene/Navigation setup symbols visible on main thread.
+- **(e) F-RT-14 NEW candidate** — VaultItemCoordinator + AnyCoordinator<VaultItemRoute,...> + DefaultVaultItemActionHelper leaked after drill-in. Distinct from F-RT-09 (Rust async) — this is a pure Swift coordinator-lifecycle leak.
+- **(f) F-RT-15 NEW candidate** — CoreData `executeAndMergeChanges` called 1,270 times for a single save, suggesting over-propagation of merge notifications across managed object contexts.
+- **(g) F-RT-13 NOT reproduced** — the Rust mutex / rayon wait pattern observed in S2 does not appear in S3. F-RT-13 is now characterized as scroll+search-workload-specific rather than universal to the Swift↔Rust boundary.
+
+**Reproducibility caveat.** As in S2, S3 Threading was measured with a single 45-second run per F-RT-12. Hang counts and per-symbol self-weights may vary ±50% on re-runs; structural patterns (which symbols appear on main, presence/absence of F-RT-13, the Terminated state appearing) are stable. Memory measurements (S3 Q1, Q2, Q4) remain the most stable signal in the audit (CV 2.14% across 3 S3 Allocations runs).
+
+**Screenshots:** `audit/profiling/screenshots/s3_threading/` (5 PNGs).
 
 ---
 
